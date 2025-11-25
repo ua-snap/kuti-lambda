@@ -18,7 +18,7 @@ zip -r lambda_package.zip .
 Update the Lambda function in AWS using the AWS CLI
 
 ```bash
-aws lambda update-function code --function-name Landslide_Risk_Insert --zip-file fildb://lambda_package.zip
+aws lambda update-function code --function-name Landslide_Risk_Insert --zip-file fileb://lambda_package.zip
 ```
 
 ## Update Lambda run time
