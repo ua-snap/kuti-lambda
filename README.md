@@ -1,5 +1,42 @@
 # Landslide Risk Lambda Insert Functions
 
+## Database and Table Configuration
+
+Database name: landslide_risk
+
+Table Configuration:
+
+```sql
+CREATE TABLE precip_risk (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    place_name VARCHAR(32) NOT NULL,
+    precip DOUBLE PRECISION NOT NULL,
+    precip_inches DOUBLE PRECISION NOT NULL,
+    hour VARCHAR(10) NOT NULL,
+    risk_prob DOUBLE PRECISION NOT NULL,
+    risk_level INTEGER NOT NULL,
+    risk_is_elevated_from_previous BOOLEAN,
+    precip24hr DOUBLE PRECISION,
+    risk24hr INTEGER,
+    precip2days DOUBLE PRECISION,
+    risk2days INTEGER,
+    precip3days DOUBLE PRECISION,
+    risk3days INTEGER,
+    expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL
+);
+
+-- Adds a unique requirement to prevent multiple entries from the same timestamp and place
+ALTER TABLE precip_risk
+  ADD CONSTRAINT unique_place_time UNIQUE (place_name, ts);
+
+-- Fast lookup by most recent timestamp
+CREATE INDEX idx_precip_risk_ts ON precip_risk (ts DESC);
+
+-- Fast lookup of latest data per location
+CREATE INDEX idx_precip_risk_place_ts ON precip_risk (place_name, ts DESC);
+```
+
 ## Importing into Lambda
 
 Download required packages for upload to Lambda.
