@@ -35,6 +35,11 @@ CREATE INDEX idx_precip_risk_ts ON precip_risk (ts DESC);
 
 -- Fast lookup of latest data per location
 CREATE INDEX idx_precip_risk_place_ts ON precip_risk (place_name, ts DESC);
+
+-- Creates expires_at field using insert timestamp
+ALTER TABLE precip_risk
+  ALTER COLUMN expires_at SET DEFAULT (NOW() + INTERVAL '3 hours');
+
 ```
 
 ## Importing into Lambda
