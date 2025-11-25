@@ -2,7 +2,7 @@ import os
 import math
 from datetime import datetime, timedelta
 import pytz
-import pymysql
+import pg8000
 
 DB_HOST = os.environ["DB_HOST"]
 DB_USER = os.environ["DB_USER"]
@@ -70,13 +70,10 @@ def lambda_handler(event, context):
     expires_at = now + timedelta(hours=3)
     expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = pymysql.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        autocommit=True,
+    conn = pg8000.connect(
+        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
     )
+    conn.autocommit = True
     try:
         with conn.cursor() as cur:
             for place_name in places_to_run:

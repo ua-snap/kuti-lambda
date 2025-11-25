@@ -2,6 +2,13 @@
 
 ## Importing into Lambda
 
+Download required packages for upload to Lambda.
+
+```bash
+pip install pytz -t .
+pip install pg8000 -t .
+```
+
 Zip all of the files contained in this directory including the Python libraries that must be included as part of this binary.
 
 ```bash
