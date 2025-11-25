@@ -29,7 +29,7 @@ def landslide_risk(rainfall_mm: float) -> int:
 
 def get_rainfall_last_3h(place_name: str) -> float:
     # Placeholder: replace with real HTTP request / API logic
-    return 0.5
+    return 1.5
 
 
 def get_places_from_event(event) -> list[str]:
@@ -86,13 +86,22 @@ def lambda_handler(event, context):
 
                 precip_inches = rainfall_mm / 25.4
 
+                # Place holders for 24hr, 2days, 3days rainfall and risk calculations
+                precip24hr = rainfall_mm * 8
+                risk24hr = landslide_risk(precip24hr)
+                precip2days = rainfall_mm * 16
+                risk2days = landslide_risk(precip2days)
+                precip3days = rainfall_mm * 24
+                risk3days = landslide_risk(precip3days)
+
                 sql = """
                 INSERT INTO precip_risk (
                   ts, place_name, precip, precip_inches, hour,
-                  risk_prob, risk_level, risk_is_elevated_from_previous, expires_at
+                  risk_prob, risk_level, risk_is_elevated_from_previous, 
+                  precip24hr, risk24hr, precip2days, risk2days, precip3days, risk3days, expires_at
                 ) VALUES (
                   %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """
                 cur.execute(
@@ -106,6 +115,12 @@ def lambda_handler(event, context):
                         prob,
                         risk,
                         risk_is_elevated,
+                        precip24hr,
+                        risk24hr,
+                        precip2days,
+                        risk2days,
+                        precip3days,
+                        risk3days,
                         expires_at_str,
                     ),
                 )
