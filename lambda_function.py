@@ -65,10 +65,10 @@ def lambda_handler(event, context):
 
     alaska_tz = pytz.timezone("US/Alaska")
     now = datetime.now(alaska_tz)
-    ts = now  # Use timezone-aware datetime object directly
+    ts = now
 
     expires_at = now + timedelta(hours=3)
-    expires_at_str = expires_at  # Use timezone-aware datetime object directly
+    expires_at_str = expires_at
 
     conn = pg8000.connect(
         host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
