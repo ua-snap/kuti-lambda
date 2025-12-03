@@ -108,7 +108,7 @@ def lambda_handler(event, context):
                   precip24hr, risk24hr, precip2days, risk2days, precip3days, risk3days, expires_at, place_id
                 ) VALUES (
                   %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """
                 cur.execute(
