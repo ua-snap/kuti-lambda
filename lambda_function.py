@@ -41,6 +41,11 @@ def get_places_from_event(event) -> list[str]:
     return []
 
 
+def get_place_id(place_name: str) -> int:
+    place_ids = {"Craig": "AK91", "Kasaan": "AK182"}
+    return place_ids.get(place_name, None)
+
+
 def is_risk_elevated_from_previous(
     cursor, place_name: str, current_prob: float
 ) -> bool:
@@ -94,14 +99,16 @@ def lambda_handler(event, context):
                 precip3days = rainfall_mm * 24
                 risk3days = landslide_risk(precip3days)
 
+                place_id = get_place_id(place_name)
+
                 sql = """
                 INSERT INTO precip_risk (
                   ts, place_name, precip, precip_inches, hour,
                   risk_prob, risk_level, risk_is_elevated_from_previous, 
-                  precip24hr, risk24hr, precip2days, risk2days, precip3days, risk3days, expires_at
+                  precip24hr, risk24hr, precip2days, risk2days, precip3days, risk3days, expires_at, place_id
                 ) VALUES (
                   %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """
                 cur.execute(
@@ -122,6 +129,7 @@ def lambda_handler(event, context):
                         precip3days,
                         risk3days,
                         expires_at_str,
+                        place_id,
                     ),
                 )
 
