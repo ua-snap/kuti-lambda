@@ -10,10 +10,19 @@ import pg8000
 import boto3
 import requests
 from ecmwf.opendata import Client
+from ecmwfapi import ECMWFService
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Add console handler for local testing
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # Database configuration
 DB_HOST = os.environ.get("DB_HOST")
@@ -23,6 +32,9 @@ DB_NAME = os.environ.get("DB_NAME")
 
 # API credentials
 SYNOPTIC_API_TOKEN = os.environ.get("SYNOPTIC_API_TOKEN")
+ECMWF_API_URL = os.environ.get("ECMWF_API_URL")
+ECMWF_API_KEY = os.environ.get("ECMWF_API_KEY")
+ECMWF_API_EMAIL = os.environ.get("ECMWF_API_EMAIL")
 
 # S3 configuration
 S3_BUCKET_NAME = "kuti-forecast-data"
@@ -41,22 +53,25 @@ LOCATIONS = {
 alaska_tz = pytz.timezone("US/Alaska")
 
 s3_client = boto3.client("s3") if S3_BUCKET_NAME else None
+ecmwf_s3_client = boto3.client("s3", region_name="eu-central-1")
+ecmwf_bucket = "ecmwf-forecasts"
 
 
-def landslide_probability(rainfall_mm: float) -> float:
-    intercept = -13.7821
-    coefficient = 0.4294
-    z = intercept + coefficient * rainfall_mm
-    return math.exp(z) / (1 + math.exp(z))
+def landslide_threshold(antecedent_mm: float) -> float:
+    m = 4.24
+    b = -0.25
+    # y = m * x ** b
+    return m * antecedent_mm**b
 
 
-def landslide_risk(rainfall_mm: float) -> int:
-    prob = landslide_probability(rainfall_mm)
-    if prob <= 0.01:
+def landslide_risk(rainfall_mm: float, antecedent_mm: float) -> int:
+    threshold_upper = landslide_threshold(antecedent_mm)
+    threshold_lower = threshold_upper / 4.0
+    if rainfall_mm < threshold_lower:
         return 0
-    elif prob <= 0.7:
+    elif rainfall_mm < threshold_upper:
         return 1
-    elif prob > 0.7:
+    elif rainfall_mm >= threshold_upper:
         return 2
 
 
@@ -214,14 +229,166 @@ def save_forecast_to_s3(forecast_time, forecast_data):
         logger.error(f"Error saving to S3 cache: {e}")
 
 
+def check_s3_historical_cache(start_time, end_time):
+    """Check if historical ECMWF data is cached in S3 for the given time range."""
+    if not s3_client or not S3_BUCKET_NAME:
+        return None
+
+    key = f"{S3_CACHE_PREFIX}/historical_hres_{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
+        data = json.loads(response["Body"].read().decode("utf-8"))
+        logger.info(f"Retrieved historical ECMWF data from S3 cache: {key}")
+        return data
+    except s3_client.exceptions.NoSuchKey:
+        logger.info(f"No cached historical data found in S3: {key}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading historical data from S3 cache: {e}")
+        return None
+
+
+def cache_s3_historical(start_time, end_time, data):
+    """Cache historical ECMWF data to S3."""
+    if not s3_client or not S3_BUCKET_NAME or not data:
+        return
+
+    key = f"{S3_CACHE_PREFIX}/historical_hres_{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=key,
+            Body=json.dumps(data),
+            ContentType="application/json",
+        )
+        logger.info(f"Cached historical ECMWF data to S3: {key}")
+    except Exception as e:
+        logger.error(f"Error saving historical data to S3 cache: {e}")
+
+
+def get_historical_ecmwf_precipitation(forecast_time):
+    """
+    Retrieve historical ECMWF forecast precipitation from public S3 bucket.
+    Downloads archived forecast data to cover the time range [historical_start_time, forecast_time).
+    Fetches data at INTENSITY_DURATION intervals (e.g., 3-hour).
+    Returns dict with Craig and Kasaan's data or None if unavailable.
+    """
+    historical_start_time = forecast_time - timedelta(hours=ANTECEDENT_PERIOD)
+
+    # Check S3 cache first
+    cached_data = check_s3_historical_cache(historical_start_time, forecast_time)
+    if cached_data:
+        return cached_data
+
+    try:
+        logger.info(
+            f"Downloading historical ECMWF data from S3: {historical_start_time.strftime('%Y-%m-%d %HZ')} to {forecast_time.strftime('%Y-%m-%d %HZ')}"
+        )
+
+        # We choose a historical initialization time earlier than the historical start time
+        # so that we have forecast data that cover that period.
+        init_time = historical_start_time.replace(minute=0, second=0, microsecond=0)
+
+        if init_time.hour >= 12:
+            init_time = init_time.replace(hour=0)  # Use midnight of same day
+        else:
+            # If historical_start_time is before noon, go back to previous day's noon forecast output
+            init_time = (init_time - timedelta(days=1)).replace(hour=12)
+
+        logger.info(
+            f"Using forecast initialized at {init_time.strftime('%Y-%m-%d %HZ')} for historical data"
+        )
+
+        # ECMWF S3 bucket structure: s3://ecmwf-forecasts/{date}/{time}z/ifs/0p25/oper/
+        date_str = init_time.strftime("%Y%m%d")
+        time_str = f"{init_time.hour:02d}z"
+        base_path = f"{date_str}/{time_str}/ifs/0p25/oper"
+
+        # Calculate which forecast steps we need to cover [historical_start_time, forecast_time)
+        historical_data = {}
+        for place_name in LOCATIONS.keys():
+            historical_data[place_name] = []
+
+        # Generate timesteps at 3 hour intervals, which matches the ECMWF output frequency
+        current_time = historical_start_time + timedelta(hours=3)
+        while current_time <= forecast_time:
+            hours_from_init = int((current_time - init_time).total_seconds() / 3600)
+
+            # Download this specific timestep
+            grib_file = f"/tmp/ecmwf_hist_{init_time.strftime('%Y%m%d%H')}_{hours_from_init}h.grib2"
+            s3_key = f"{base_path}/{date_str}{init_time.hour:02d}0000-{hours_from_init}h-oper-fc.grib2"
+
+            logger.info(
+                f"Downloading historical step {hours_from_init}h from s3://{ecmwf_bucket}/{s3_key}"
+            )
+
+            try:
+                ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
+
+                # Open GRIB file and grab the total precipitation variable
+                ds = xr.open_dataset(
+                    grib_file,
+                    engine="cfgrib",
+                    backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
+                )
+
+                for place_name, location_info in LOCATIONS.items():
+                    lat = location_info["lat"]
+                    lon = location_info["lon"]
+
+                    # Pull the closest data location for this timestep
+                    precip_values = ds["tp"].sel(
+                        latitude=lat, longitude=lon, method="nearest"
+                    )
+
+                    # Total precipitation is returned in meters, convert to millimeters
+                    precip_m = float(precip_values.values)
+                    precip_mm = precip_m * 1000
+
+                    # Calculate timestamp in Alaska timezone
+                    ts_alaska = current_time.astimezone(alaska_tz)
+
+                    historical_data[place_name].append(
+                        {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                    )
+
+                ds.close()
+
+                # Remove the GRIB file after being processed
+                if os.path.exists(grib_file):
+                    os.remove(grib_file)
+
+            except Exception as e:
+                # TODO: If any step fails, do we consider the data invalid?
+                logger.error(
+                    f"Error downloading/processing historical step {hours_from_init}h: {e}"
+                )
+
+            current_time += timedelta(hours=3)
+
+        # Cache the results to S3 since the data needed won't change for 12 hours
+        if historical_data and any(historical_data.values()):
+            cache_s3_historical(historical_start_time, forecast_time, historical_data)
+            return historical_data
+        else:
+            logger.error("No historical data retrieved")
+            return None
+
+    except Exception as e:
+        logger.exception(f"Error retrieving historical ECMWF data from S3: {e}")
+        return None
+
+
 def get_forecast_precipitation():
     """
     Retrieve 72-hour ECMWF Open Data forecast precipitation for Craig and Kasaan.
+    Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
+    Only 500 connections allowed globally at the same time, so API access isn't great.
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
 
     # The forecast update interval is every 12 hours, so we check to see whether
-    # .a new forecast is available or not.
+    # a new forecast is available or not.
     now = datetime.now(pytz.UTC)
     if now.hour >= 12:
         forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
@@ -234,58 +401,76 @@ def get_forecast_precipitation():
     if cached_forecast:
         return cached_forecast
 
-    # If no forecast is cached, we must get the latest one from ECMWF.
+    # Download from ECMWF's public S3 bucket instead of using rate-limited API
     try:
         logger.info(
-            f"Requesting ECMWF Open Data forecast for {forecast_time.strftime('%Y-%m-%d %HZ')}"
+            f"Downloading ECMWF forecast from S3 bucket for {forecast_time.strftime('%Y-%m-%d %HZ')}"
         )
 
-        client = Client(source="ecmwf")
+        # ECMWF S3 bucket structure: s3://ecmwf-forecasts/{date}/{time}z/ifs/0p25/oper/
+        # Files: {date}{time}0000-{step}h-oper-fc.grib2
+        date_str = forecast_time.strftime("%Y%m%d")
+        time_str = f"{forecast_time.hour:02d}z"
+        base_path = f"{date_str}/{time_str}/ifs/0p25/oper"
 
-        # Temporary location for downloaded GRIB file.
-        grib_file = f"/tmp/ecmwf_forecast_{forecast_time.strftime('%Y%m%d%H')}.grib2"
-
-        # Client usage documentation: https://github.com/ecmwf/ecmwf-opendata
-        client.retrieve(
-            date=forecast_time,
-            time=forecast_time.hour,
-            step=list(range(INTENSITY_DURATION, 75, INTENSITY_DURATION)),
-            stream="oper",  # Operational forecast
-            type="fc",  # Forecast
-            param="tp",  # Total precipitation
-            target=grib_file,
-        )
-
-        ds = xr.open_dataset(grib_file, engine="cfgrib")
-
+        # Download individual timestep files and combine data
         forecast_data = {}
+        for place_name in LOCATIONS.keys():
+            forecast_data[place_name] = []
 
-        for place_name, location_info in LOCATIONS.items():
-            lat = location_info["lat"]
-            lon = location_info["lon"]
+        # Download each timestep we need (3h, 6h, 9h, up to 84h)
+        # We need 84 hours to cover the full 72-hour forecast period with
+        # updates to the current forecast time every 3 hours.
+        for step_hours in range(3, 87, 3):
+            grib_file = f"/tmp/ecmwf_fc_{forecast_time.strftime('%Y%m%d%H')}_{step_hours}h.grib2"
+            s3_key = f"{base_path}/{date_str}{forecast_time.hour:02d}0000-{step_hours}h-oper-fc.grib2"
 
-            # Pull the closest data location
-            precip_values = ds["tp"].sel(latitude=lat, longitude=lon, method="nearest")
+            logger.info(
+                f"Downloading step {step_hours}h from s3://{ecmwf_bucket}/{s3_key}"
+            )
 
-            # Extract all of the times and their total precipitation
-            all_times = []
-            for time_idx in range(len(precip_values.step)):
-                # This converts the step value from nanoseconds to hours
-                step_hours = int(precip_values.step[time_idx].values / 3600000000000)
-                ts = forecast_time + timedelta(hours=step_hours)
-                ts_alaska = ts.astimezone(alaska_tz)
+            try:
+                ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
 
-                # Total precipitation is returned in meters
-                # We will be converting those values to millimeters.
-                precip_m = float(precip_values.isel(step=time_idx).values)
-                precip_mm = precip_m * 1000
-
-                all_times.append(
-                    {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                # Parse GRIB file for this timestep - filter to only total precipitation
+                # to avoid conflicts from multiple variables at different heights
+                ds = xr.open_dataset(
+                    grib_file,
+                    engine="cfgrib",
+                    backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
                 )
 
-            forecast_data[place_name] = all_times
-        ds.close()
+                for place_name, location_info in LOCATIONS.items():
+                    lat = location_info["lat"]
+                    lon = location_info["lon"]
+
+                    # Pull the closest data location for this timestep
+                    precip_values = ds["tp"].sel(
+                        latitude=lat, longitude=lon, method="nearest"
+                    )
+
+                    ts = forecast_time + timedelta(hours=step_hours)
+                    ts_alaska = ts.astimezone(alaska_tz)
+
+                    # Total precipitation is returned in meters, convert to millimeters
+                    precip_m = float(precip_values.values)
+                    precip_mm = precip_m * 1000
+
+                    forecast_data[place_name].append(
+                        {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                    )
+
+                ds.close()
+
+                # Remove the GRIB file after being processed
+                if os.path.exists(grib_file):
+                    os.remove(grib_file)
+
+            except Exception as e:
+                # TODO: Same question. If any step fails, do we consider the whole data invalid.
+                # What do we do in that case?
+                logger.error(f"Error downloading/processing step {step_hours}h: {e}")
+                continue
 
         # Save forecast data to S3 for reference within the 12 hour
         # window between model run outputs.
@@ -294,84 +479,83 @@ def get_forecast_precipitation():
         return forecast_data
 
     except Exception as e:
-        logger.exception(f"Error retrieving ECMWF Open Data forecast: {e}")
+        logger.exception(f"Error downloading ECMWF forecast from S3: {e}")
         return None
 
 
-def calculate_forecast_windows(forecast_time_series, gauge_24hr_precip=None):
+def calculate_forecast_windows(forecast_time_series, historical_data=None):
     """
     Calculate intensity windows for the full 72-hour forecast period.
     For each INTENSITY_DURATION period (e.g., 3 hours), calculate:
     - intensity_mm: rainfall in that discrete 3-hour period (single timestamp)
     - antecedent_mm: sum of previous INTENSITY_DURATION periods within ANTECEDENT_PERIOD lookback
 
-    Uses gauge 24hr precipitation for early windows when available, then transitions to forecast-only.
+    If historical_data is provided, it is prepended to forecast_time_series to provide
+    complete antecedent coverage from the first forecast timestep.
     Returns single array with all forecast timesteps.
     Risk is calculated from intensity only.
     """
     if not forecast_time_series:
         return []
 
-    # Convert forecast ISO timestamp strings to datetime objects
-    forecast_data = []
-    for item in forecast_time_series:
-        dt = datetime.fromisoformat(item["timestamp"])
-        forecast_data.append((dt, item["precip_mm"]))
+    # Combine historical and forecast data
+    combined_data = []
+
+    # Add historical data
+    for hindcast in historical_data:
+        timestamp = datetime.fromisoformat(hindcast["timestamp"])
+        combined_data.append((timestamp, hindcast["precip_mm"]))
+
+    # Add forecast data
+    for forecast in forecast_time_series:
+        timestamp = datetime.fromisoformat(forecast["timestamp"])
+        combined_data.append((timestamp, forecast["precip_mm"]))
 
     # Sort by time
-    forecast_data.sort(key=lambda x: x[0])
-    forecast_start = forecast_data[0][0]
+    combined_data.sort(key=lambda x: x[0])
+
+    # Determine where forecast starts (for calculating forecast_hour)
+    historical_count = len(historical_data)
 
     # Calculate how many timesteps fit in antecedent period
     timesteps_in_antecedent = ANTECEDENT_PERIOD // INTENSITY_DURATION
 
-    windows = []
+    forecast_windows = []
 
-    # Process ALL timesteps
-    for i in range(len(forecast_data)):
-        window_end_time = forecast_data[i][0]
+    # Process only the forecast portion of the data
+    for i in range(historical_count, len(combined_data)):
+        window_end_time = combined_data[i][0]
 
         # Intensity is ONLY the current 3-hour period (current timestamp)
-        intensity_mm = forecast_data[i][1]
+        intensity_mm = combined_data[i][1]
 
         # Calculate antecedent: sum of previous timesteps within lookback window
-        if i < timesteps_in_antecedent:
-            # Early windows: not enough forecast history
-            # Use gauge 24hr precipitation if available, otherwise sum what we have
-            if gauge_24hr_precip is not None:
-                antecedent_mm = gauge_24hr_precip + sum(
-                    precip for dt, precip in forecast_data[:i]
-                )
-            else:
-                # Sum all previous forecast timesteps (partial antecedent)
-                antecedent_mm = sum(precip for dt, precip in forecast_data[:i])
-        else:
-            # Later windows: full antecedent period available in forecast
-            # Sum previous timesteps within the lookback window
-            lookback_start_index = i - timesteps_in_antecedent
-            antecedent_mm = sum(
-                precip for dt, precip in forecast_data[lookback_start_index:i]
-            )
+        # With historical data prepended, we now have full antecedent coverage
 
-        # Calculate risk from intensity only
-        risk_prob = landslide_probability(intensity_mm)
-        risk_level = landslide_risk(intensity_mm)
+        # Full antecedent period available: sliding window
+        lookback_start_index = i - timesteps_in_antecedent
+        antecedent_mm = sum(
+            precip for dt, precip in combined_data[lookback_start_index:i]
+        )
 
-        # Calculate forecast hour (hours from forecast start)
-        forecast_hour = (i + 1) * INTENSITY_DURATION
+        landslide_threshold_upper = landslide_threshold(antecedent_mm)
+        landslide_risk_level = landslide_risk(intensity_mm, antecedent_mm)
 
-        windows.append(
+        # Calculate forecast hour (hours from forecast start, excluding historical)
+        forecast_hour = (i - historical_count + 1) * INTENSITY_DURATION
+
+        forecast_windows.append(
             {
                 "timestamp": window_end_time.isoformat(),
                 "forecast_hour": forecast_hour,
                 "intensity_mm": round(intensity_mm, 2),
                 "antecedent_mm": round(antecedent_mm, 2),
-                "risk_prob": round(risk_prob, 2),
-                "risk_level": risk_level,
+                "risk_threshold_upper": round(landslide_threshold_upper, 2),
+                "risk_level": landslide_risk_level,
             }
         )
 
-    return windows
+    return forecast_windows
 
 
 def get_places_from_event(event) -> list[str]:
@@ -397,14 +581,43 @@ def lambda_handler(event, context):
     conn.autocommit = True
 
     now = datetime.now(alaska_tz)
-    ts = now
 
     expires_at = now + timedelta(hours=3)
     expires_at_str = expires_at.isoformat()
 
+    # Determine forecast initialization time (midnight or noon)
+    if now.hour >= 12:
+        forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    else:
+        forecast_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Fetch historical ECMWF data for antecedent period from archived forecasts in S3
+    logger.info(
+        f"Retrieving historical ECMWF data for {ANTECEDENT_PERIOD}-hour antecedent period from S3 archive..."
+    )
+    historical_data = get_historical_ecmwf_precipitation(forecast_time)
+
+    if historical_data is None:
+        logger.error("No historical ECMWF data available, aborting processing.")
+        conn.close()
+        return {
+            "status": "error",
+            "message": "No historical ECMWF data available",
+            "timestamp": now.isoformat(),
+        }
+
     logger.info("Retrieving ECMWF forecast data...")
     forecast_data = get_forecast_precipitation()
     forecast_retrieved_at = now if forecast_data else None
+
+    if forecast_data is None:
+        logger.error("No ECMWF forecast data available, aborting processing.")
+        conn.close()
+        return {
+            "status": "error",
+            "message": "No ECMWF forecast data available",
+            "timestamp": now.isoformat(),
+        }
 
     try:
         with conn.cursor() as cur:
@@ -425,11 +638,13 @@ def lambda_handler(event, context):
 
                 # Calculate risk from real-time intensity
                 if rainfall_mm is not None:
-                    prob = landslide_probability(rainfall_mm)
-                    risk = landslide_risk(rainfall_mm)
+                    landslide_threshold_upper = landslide_threshold(realtime_antecedent)
+                    landslide_risk_level = landslide_risk(
+                        rainfall_mm, realtime_antecedent
+                    )
                 else:
-                    prob = None
-                    risk = None
+                    landslide_threshold_upper = None
+                    landslide_risk_level = None
 
                 # Calculate forecast windows for this location
                 forecast_windows = None
@@ -437,8 +652,13 @@ def lambda_handler(event, context):
                 if forecast_data and place_name in forecast_data:
                     current_location_forecast = forecast_data[place_name]
 
+                    # Get historical data for this location if available
+                    current_location_historical = None
+                    if historical_data and place_name in historical_data:
+                        current_location_historical = historical_data[place_name]
+
                     windows_array = calculate_forecast_windows(
-                        current_location_forecast, realtime_antecedent
+                        current_location_forecast, current_location_historical
                     )
 
                     # Convert to JSON string for PSQL JSONB column
@@ -455,20 +675,19 @@ def lambda_handler(event, context):
                 ) VALUES (
                   %s, %s, %s, %s,
                   %s, %s, %s,
-                  %s, %s, %s, %s,
-                  %s, %s
+                  %s, %s, %s, %s
                 )
                 """
                 cur.execute(
                     sql,
                     (
-                        ts,
+                        now,
                         place_name,
                         place_id,
                         expires_at_str,
                         rainfall_mm,
-                        prob,
-                        risk,
+                        landslide_threshold_upper,
+                        landslide_risk_level,
                         gauge_id,
                         realtime_antecedent,
                         forecast_windows,
@@ -481,7 +700,7 @@ def lambda_handler(event, context):
         return {
             "status": "ok",
             "places_processed": places_to_run,
-            "timestamp": ts.isoformat(),
+            "timestamp": now.isoformat(),
             "forecast_available": forecast_data is not None,
         }
     finally:
