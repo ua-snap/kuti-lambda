@@ -9,6 +9,10 @@ import pytz
 import pg8000
 import boto3
 import requests
+import time
+
+# ECMWF OpenData client, though we use S3 access directly to avoid rate limits
+# May consider coming back to this later per suggestion
 from ecmwf.opendata import Client
 from ecmwfapi import ECMWFService
 
@@ -32,9 +36,6 @@ DB_NAME = os.environ.get("DB_NAME")
 
 # API credentials
 SYNOPTIC_API_TOKEN = os.environ.get("SYNOPTIC_API_TOKEN")
-ECMWF_API_URL = os.environ.get("ECMWF_API_URL")
-ECMWF_API_KEY = os.environ.get("ECMWF_API_KEY")
-ECMWF_API_EMAIL = os.environ.get("ECMWF_API_EMAIL")
 
 # S3 configuration
 S3_BUCKET_NAME = "kuti-forecast-data"
@@ -58,15 +59,15 @@ ecmwf_bucket = "ecmwf-forecasts"
 
 
 def landslide_threshold(antecedent_mm: float) -> float:
-    m = 4.24
-    b = -0.25
+    m = 14
+    b = -0.05
     # y = m * x ** b
     return m * antecedent_mm**b
 
 
 def landslide_risk(rainfall_mm: float, antecedent_mm: float) -> int:
     threshold_upper = landslide_threshold(antecedent_mm)
-    threshold_lower = threshold_upper / 4.0
+    threshold_lower = threshold_upper / 2
     if rainfall_mm < threshold_lower:
         return 0
     elif rainfall_mm < threshold_upper:
@@ -75,7 +76,7 @@ def landslide_risk(rainfall_mm: float, antecedent_mm: float) -> int:
         return 2
 
 
-def get_gauge_precipitation(place_name: str, alaska_tz):
+def get_gauge_precipitation(place_name: str):
     """
     Retrieve real-time precipitation data from Synoptic API for the given location.
     Returns dict with intensity and antecedent values, or None if data unavailable.
@@ -187,6 +188,10 @@ def get_gauge_precipitation(place_name: str, alaska_tz):
         return None
 
 
+########################################################################
+# We may get rid of these S3 caching functions to prevent complexity.  #
+# since ECMWF OpenData S3 access is fast enough for our needs.         #
+########################################################################
 def check_s3_forecast_cache(forecast_time):
     """Check if ECMWF forecast is cached in S3 for the given forecast time."""
     if not s3_client or not S3_BUCKET_NAME:
@@ -211,8 +216,9 @@ def save_forecast_to_s3(forecast_time, forecast_data):
     """
     Save parsed forecast data to S3 cache. Data is generated twice
     per day at midnight and noon, so instead of waiting the full
-    download time from the ECMWF API, we cache the results for the
-    12 hour interval that we can utilize this data.
+    download time from the ECMWF S3 bucket, we cache the results for the
+    12 hour interval so that we can utilize this data without a multi-minute
+    delay.
     """
 
     key = f"{S3_CACHE_PREFIX}/forecast/{forecast_time.strftime('%Y%m%d-%H')}Z.json"
@@ -234,7 +240,7 @@ def check_s3_historical_cache(start_time, end_time):
     if not s3_client or not S3_BUCKET_NAME:
         return None
 
-    key = f"{S3_CACHE_PREFIX}/historical_hres_{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
+    key = f"{S3_CACHE_PREFIX}/historical/{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
     try:
         response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
         data = json.loads(response["Body"].read().decode("utf-8"))
@@ -249,11 +255,14 @@ def check_s3_historical_cache(start_time, end_time):
 
 
 def cache_s3_historical(start_time, end_time, data):
-    """Cache historical ECMWF data to S3."""
+    """
+    Cache historical ECMWF data to S3. This prevents re-downloading 24 hours
+    of archived forecast data multiple times within the same day.
+    """
     if not s3_client or not S3_BUCKET_NAME or not data:
         return
 
-    key = f"{S3_CACHE_PREFIX}/historical_hres_{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
+    key = f"{S3_CACHE_PREFIX}/historical/{start_time.strftime('%Y%m%d%H')}_{end_time.strftime('%Y%m%d%H')}.json"
     try:
         s3_client.put_object(
             Bucket=S3_BUCKET_NAME,
@@ -270,7 +279,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
     """
     Retrieve historical ECMWF forecast precipitation from public S3 bucket.
     Downloads archived forecast data to cover the time range [historical_start_time, forecast_time).
-    Fetches data at INTENSITY_DURATION intervals (e.g., 3-hour).
+    Data is available in 3 hour intervals starting at the 00 or 12 initialization of the model.
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
     historical_start_time = forecast_time - timedelta(hours=ANTECEDENT_PERIOD)
@@ -322,47 +331,78 @@ def get_historical_ecmwf_precipitation(forecast_time):
                 f"Downloading historical step {hours_from_init}h from s3://{ecmwf_bucket}/{s3_key}"
             )
 
-            try:
-                ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
+            # Retry logic with exponential backoff for SlowDown errors
+            max_retries = 5
+            retry_delay = 2  # Start with 2 seconds
 
-                # Open GRIB file and grab the total precipitation variable
-                ds = xr.open_dataset(
-                    grib_file,
-                    engine="cfgrib",
-                    backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
-                )
+            for attempt in range(max_retries):
+                try:
+                    ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
 
-                for place_name, location_info in LOCATIONS.items():
-                    lat = location_info["lat"]
-                    lon = location_info["lon"]
-
-                    # Pull the closest data location for this timestep
-                    precip_values = ds["tp"].sel(
-                        latitude=lat, longitude=lon, method="nearest"
+                    # Open GRIB file and grab the total precipitation variable
+                    ds = xr.open_dataset(
+                        grib_file,
+                        engine="cfgrib",
+                        backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
                     )
 
-                    # Total precipitation is returned in meters, convert to millimeters
-                    precip_m = float(precip_values.values)
-                    precip_mm = precip_m * 1000
+                    for place_name, location_info in LOCATIONS.items():
+                        lat = location_info["lat"]
+                        lon = location_info["lon"]
 
-                    # Calculate timestamp in Alaska timezone
-                    ts_alaska = current_time.astimezone(alaska_tz)
+                        # Pull the closest data location for this timestep
+                        precip_values = ds["tp"].sel(
+                            latitude=lat, longitude=lon, method="nearest"
+                        )
 
-                    historical_data[place_name].append(
-                        {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
-                    )
+                        # Total precipitation is returned in meters, convert to millimeters
+                        precip_m = float(precip_values.values)
 
-                ds.close()
+                        # Convert to millimeters divided by 3 hour period to get intensity mm/hr
+                        precip_mm = (precip_m * 1000) / 3
 
-                # Remove the GRIB file after being processed
-                if os.path.exists(grib_file):
-                    os.remove(grib_file)
+                        # Calculate timestamp in Alaska timezone
+                        ts_alaska = current_time.astimezone(alaska_tz)
 
-            except Exception as e:
-                # TODO: If any step fails, do we consider the data invalid?
-                logger.error(
-                    f"Error downloading/processing historical step {hours_from_init}h: {e}"
-                )
+                        historical_data[place_name].append(
+                            {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                        )
+
+                    ds.close()
+
+                    # Remove the GRIB file after being processed
+                    if os.path.exists(grib_file):
+                        os.remove(grib_file)
+
+                    # Success - break out of retry loop
+                    break
+
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        # Check if it's a SlowDown error
+                        error_str = str(e)
+                        if "SlowDown" in error_str or "503" in error_str:
+                            logger.warning(
+                                f"SlowDown error on historical step {hours_from_init}h (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {retry_delay}s..."
+                            )
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            logger.error(
+                                f"Error downloading/processing historical step {hours_from_init}h: {e}"
+                            )
+                            break
+                    else:
+                        logger.error(
+                            f"Failed to download historical step {hours_from_init}h after {max_retries} attempts: {e}"
+                        )
+                        # Clean up partial file if it exists
+                        if os.path.exists(grib_file):
+                            os.remove(grib_file)
+
+                        # If we can't get a timestep, abort
+                        return None
 
             current_time += timedelta(hours=3)
 
@@ -379,22 +419,13 @@ def get_historical_ecmwf_precipitation(forecast_time):
         return None
 
 
-def get_forecast_precipitation():
+def get_forecast_precipitation(forecast_time):
     """
     Retrieve 72-hour ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
     Only 500 connections allowed globally at the same time, so API access isn't great.
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
-
-    # The forecast update interval is every 12 hours, so we check to see whether
-    # a new forecast is available or not.
-    now = datetime.now(pytz.UTC)
-    if now.hour >= 12:
-        forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    else:
-        forecast_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
     # We save the forecast to S3 to save time on subsequent requests
     # Check for the most recent forecast before downloading it.
     cached_forecast = check_s3_forecast_cache(forecast_time)
@@ -429,48 +460,87 @@ def get_forecast_precipitation():
                 f"Downloading step {step_hours}h from s3://{ecmwf_bucket}/{s3_key}"
             )
 
-            try:
-                ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
+            # Retry logic with exponential backoff for SlowDown errors
+            max_retries = 5
+            retry_delay = 2  # Start with 2 seconds
 
-                # Parse GRIB file for this timestep - filter to only total precipitation
-                # to avoid conflicts from multiple variables at different heights
-                ds = xr.open_dataset(
-                    grib_file,
-                    engine="cfgrib",
-                    backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
-                )
+            for attempt in range(max_retries):
+                try:
+                    ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
 
-                for place_name, location_info in LOCATIONS.items():
-                    lat = location_info["lat"]
-                    lon = location_info["lon"]
-
-                    # Pull the closest data location for this timestep
-                    precip_values = ds["tp"].sel(
-                        latitude=lat, longitude=lon, method="nearest"
+                    # Parse GRIB file for this timestep - filter to only total precipitation
+                    # to avoid conflicts from multiple variables at different heights
+                    ds = xr.open_dataset(
+                        grib_file,
+                        engine="cfgrib",
+                        backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
                     )
 
-                    ts = forecast_time + timedelta(hours=step_hours)
-                    ts_alaska = ts.astimezone(alaska_tz)
+                    for place_name, location_info in LOCATIONS.items():
+                        lat = location_info["lat"]
+                        lon = location_info["lon"]
 
-                    # Total precipitation is returned in meters, convert to millimeters
-                    precip_m = float(precip_values.values)
-                    precip_mm = precip_m * 1000
+                        # Pull the closest data location for this timestep
+                        precip_values = ds["tp"].sel(
+                            latitude=lat, longitude=lon, method="nearest"
+                        )
 
-                    forecast_data[place_name].append(
-                        {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
-                    )
+                        if step_hours == 3:
+                            actual_lat = float(precip_values.latitude.values)
+                            actual_lon = float(precip_values.longitude.values)
+                            logger.info(
+                                f"{place_name}: requested ({lat}, {lon}), "
+                                f"using grid cell ({actual_lat}, {actual_lon})"
+                            )
 
-                ds.close()
+                        ts = forecast_time + timedelta(hours=step_hours)
+                        ts_alaska = ts.astimezone(alaska_tz)
 
-                # Remove the GRIB file after being processed
-                if os.path.exists(grib_file):
-                    os.remove(grib_file)
+                        # Total precipitation is returned in meters, convert to millimeters
+                        precip_m = float(precip_values.values)
 
-            except Exception as e:
-                # TODO: Same question. If any step fails, do we consider the whole data invalid.
-                # What do we do in that case?
-                logger.error(f"Error downloading/processing step {step_hours}h: {e}")
-                continue
+                        # Convert to millimeters divided by 3 hour period to get intensity mm/hr
+                        precip_mm = (precip_m * 1000) / 3
+
+                        forecast_data[place_name].append(
+                            {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                        )
+
+                    ds.close()
+
+                    # Remove the GRIB file after being processed
+                    if os.path.exists(grib_file):
+                        os.remove(grib_file)
+
+                    # Success - break out of retry loop
+                    break
+
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        # Check if it's a SlowDown error
+                        error_str = str(e)
+                        if "SlowDown" in error_str or "503" in error_str:
+                            logger.warning(
+                                f"SlowDown error on step {step_hours}h (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {retry_delay}s..."
+                            )
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            logger.error(
+                                f"Error downloading/processing step {step_hours}h: {e}"
+                            )
+                            break
+                    else:
+                        logger.error(
+                            f"Failed to download step {step_hours}h after {max_retries} attempts: {e}"
+                        )
+                        # Clean up partial file if it exists
+                        if os.path.exists(grib_file):
+                            os.remove(grib_file)
+
+                        # If we can't get a timestep, abort
+                        return None
 
         # Save forecast data to S3 for reference within the 12 hour
         # window between model run outputs.
@@ -607,8 +677,7 @@ def lambda_handler(event, context):
         }
 
     logger.info("Retrieving ECMWF forecast data...")
-    forecast_data = get_forecast_precipitation()
-    forecast_retrieved_at = now if forecast_data else None
+    forecast_data = get_forecast_precipitation(forecast_time)
 
     if forecast_data is None:
         logger.error("No ECMWF forecast data available, aborting processing.")
@@ -622,29 +691,14 @@ def lambda_handler(event, context):
     try:
         with conn.cursor() as cur:
             for place_name in places_to_run:
-                # TODO: Implement real-time gauge data retrieval
-                # when Synoptic account is approved.
                 logger.info(f"Processing {place_name}...")
-                gauge_data = get_gauge_precipitation(place_name, alaska_tz)
-                if gauge_data:
-                    rainfall_mm = gauge_data["intensity_mm"]
-                    gauge_id = gauge_data["gauge_id"]
-                    realtime_antecedent = gauge_data["antecedent_mm"]
-                else:
-                    # No gauge data available
-                    rainfall_mm = None
-                    gauge_id = None
-                    realtime_antecedent = None
 
-                # Calculate risk from real-time intensity
-                if rainfall_mm is not None:
-                    landslide_threshold_upper = landslide_threshold(realtime_antecedent)
-                    landslide_risk_level = landslide_risk(
-                        rainfall_mm, realtime_antecedent
-                    )
-                else:
-                    landslide_threshold_upper = None
-                    landslide_risk_level = None
+                # Placeholder values for gauge data (to be implemented later)
+                rainfall_mm = None
+                gauge_id = None
+                realtime_antecedent = None
+                landslide_threshold_upper = None
+                landslide_risk_level = None
 
                 # Calculate forecast windows for this location
                 forecast_windows = None
@@ -661,8 +715,42 @@ def lambda_handler(event, context):
                         current_location_forecast, current_location_historical
                     )
 
+                    # Calculate current forecast hour based on time since initialization
+                    hours_since_init = (now - forecast_time).total_seconds() / 3600
+                    current_forecast_hour = (
+                        math.ceil(hours_since_init / INTENSITY_DURATION)
+                        * INTENSITY_DURATION
+                    )
+
+                    # Special case: if exactly on a 3-hour boundary, use that hour
+                    if (
+                        hours_since_init % INTENSITY_DURATION == 0
+                        and hours_since_init > 0
+                    ):
+                        current_forecast_hour = int(hours_since_init)
+
+                    # Filter to rolling 72-hour window starting from current time
+                    rolling_windows = [
+                        window
+                        for window in windows_array
+                        if window["forecast_hour"] >= current_forecast_hour
+                    ][
+                        :24
+                    ]  # 24 windows = 72 hours
+
+                    logger.info(
+                        f"Rolling forecast window: {len(rolling_windows)} windows from hour {current_forecast_hour}"
+                    )
+                    if rolling_windows:
+                        logger.info(
+                            f"First window: hour {rolling_windows[0]['forecast_hour']} ending at {rolling_windows[0]['timestamp']}"
+                        )
+                        logger.info(
+                            f"Last window: hour {rolling_windows[-1]['forecast_hour']} ending at {rolling_windows[-1]['timestamp']}"
+                        )
+
                     # Convert to JSON string for PSQL JSONB column
-                    forecast_windows = json.dumps(windows_array)
+                    forecast_windows = json.dumps(rolling_windows)
 
                 place_id = get_place_id(place_name)
 
@@ -671,11 +759,11 @@ def lambda_handler(event, context):
                   ts, place_name, place_id, expires_at,
                   rainfall_mm, risk_prob, risk_level,
                   gauge_id, realtime_antecedent_mm,
-                  forecast_windows, forecast_retrieved_at
+                  forecast_windows
                 ) VALUES (
                   %s, %s, %s, %s,
                   %s, %s, %s,
-                  %s, %s, %s, %s
+                  %s, %s, %s
                 )
                 """
                 cur.execute(
@@ -691,7 +779,6 @@ def lambda_handler(event, context):
                         gauge_id,
                         realtime_antecedent,
                         forecast_windows,
-                        forecast_retrieved_at,
                     ),
                 )
 
