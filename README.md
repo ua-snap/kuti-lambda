@@ -96,3 +96,11 @@ Confirm that the change is recognized
 ```bash
 aws events describe-rule --name Landslide_Risk_Event
 ```
+
+## Running the Lambda function locally
+
+If you want to run the Lambda function locally, you can use the downloaded Python dependencies by running the following command from this directory:
+
+```bash
+PYTHONPATH=python_deps/python python lambda_function.py
+```
