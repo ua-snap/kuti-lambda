@@ -7,62 +7,81 @@ Database name: landslide_risk
 Table Configuration:
 
 ```sql
-CREATE TABLE precip_risk (
-    id SERIAL PRIMARY KEY,
-    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL,
-    place_name VARCHAR(32) NOT NULL,
-    place_id VARCHAR(10) NOT NULL,
-    precip DOUBLE PRECISION NOT NULL,
-    precip_inches DOUBLE PRECISION NOT NULL,
-    hour VARCHAR(10) NOT NULL,
-    risk_prob DOUBLE PRECISION NOT NULL,
-    risk_level INTEGER NOT NULL,
-    risk_is_elevated_from_previous BOOLEAN,
-    precip24hr DOUBLE PRECISION,
-    risk24hr INTEGER,
-    precip2days DOUBLE PRECISION,
-    risk2days INTEGER,
-    precip3days DOUBLE PRECISION,
-    risk3days INTEGER,
-    expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL
+CREATE TABLE landslide_risk (
+  id SERIAL PRIMARY KEY,
+  ts TIMESTAMP WITH TIME ZONE NOT NULL,
+  place_name TEXT NOT NULL,
+  place_id TEXT,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  realtime_rainfall_mm NUMERIC,
+  realtime_threshold_upper NUMERIC,
+  realtime_risk_level INTEGER,
+  gauge_id TEXT,
+  realtime_antecedent_mm NUMERIC,
+  forecast_blocks JSONB
 );
 
--- Adds a unique requirement to prevent multiple entries from the same timestamp and place
-ALTER TABLE precip_risk
-  ADD CONSTRAINT unique_place_time UNIQUE (place_name, ts);
-
--- Fast lookup by most recent timestamp
-CREATE INDEX idx_precip_risk_ts ON precip_risk (ts DESC);
-
--- Fast lookup of latest data per location
-CREATE INDEX idx_precip_risk_place_ts ON precip_risk (place_name, ts DESC);
-
--- Creates expires_at field using insert timestamp
-ALTER TABLE precip_risk
-  ALTER COLUMN expires_at SET DEFAULT (NOW() + INTERVAL '3 hours');
+-- Indexes
+CREATE INDEX idx_landslide_risk_place_ts ON landslide_risk (place_name, ts DESC);
+CREATE INDEX idx_landslide_risk_place_id_ts ON landslide_risk (place_id, ts DESC);
+CREATE INDEX idx_landslide_risk_expires_at ON landslide_risk (expires_at);
+CREATE INDEX idx_landslide_risk_ts ON landslide_risk (ts DESC);
 
 ```
 
 ## Importing into Lambda
 
-Download required packages for upload to Lambda.
+### Step 1: Install Dependencies
 
 ```bash
-pip install pytz -t .
-pip install pg8000 -t .
+pip install -r requirements.txt -t python_deps/python/
 ```
 
-Zip all of the files contained in this directory including the Python libraries that must be included as part of this binary.
+### Step 2: Create and Upload Lambda Layer
+
+Zip the dependencies into a Lambda Layer:
 
 ```bash
-zip -r lambda_package.zip .
+cd python_deps && zip -r ../lambda-layer.zip python/ && cd ..
 ```
 
-Update the Lambda function in AWS using the AWS CLI
+Upload the layer to AWS:
 
 ```bash
-aws lambda update-function code --function-name Landslide_Risk_Insert --zip-file fileb://lambda_package.zip
+aws lambda publish-layer-version \
+  --layer-name kuti-dependencies \
+  --description "Dependencies for Landslide Risk Lambda" \
+  --zip-file fileb://lambda-layer.zip \
+  --compatible-runtimes python3.11 python3.12
 ```
+
+Note the `LayerVersionArn` from the output (you'll need it in Step 4).
+
+### Step 3: Update Lambda Function Code
+
+Zip only the function code (without dependencies):
+
+```bash
+zip lambda_function.zip lambda_function.py
+```
+
+Update the Lambda function:
+
+```bash
+aws lambda update-function-code --function-name Landslide_Risk_Insert --zip-file fileb://lambda_function.zip
+```
+
+### Step 4: Attach Layer to Function
+
+Replace `<LayerVersionArn>` with the ARN from Step 2:
+
+```bash
+aws lambda update-function-configuration \
+  --function-name Landslide_Risk_Insert \
+  --layers <LayerVersionArn>
+```
+
+Example: `arn:aws:lambda:us-west-2:123456789012:layer:kuti-dependencies:1`
 
 ## Update Lambda run time
 

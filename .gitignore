@@ -1,8 +1,2 @@
 __pycache__/
-asn1crypto*
-dateutil*
-pg8000*
-python*
-pytz*
-six*
-scramp*
+python_deps/

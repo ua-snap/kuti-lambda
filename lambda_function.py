@@ -42,7 +42,6 @@ S3_BUCKET_NAME = "kuti-forecast-data"
 S3_CACHE_PREFIX = os.environ.get("S3_CACHE_PREFIX", "ecmwf-cache")
 
 # Configurable parameters
-INTENSITY_DURATION = int(os.environ.get("INTENSITY_DURATION", 3))  # hours
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
 # Location coordinates (lat, lon) for nearest grid cell lookup
@@ -96,19 +95,11 @@ def get_gauge_precipitation(place_name: str):
 
     gauge_id = location_info["gauge_id"]
 
-    return {
-        "intensity_mm": 0.5,
-        "antecedent_mm": 0.5,
-        "gauge_id": gauge_id,
-    }
-
     # TODO: Figure out what needs to come out of Synoptic when I have
     # access to the API.
     # Calculate time window: need max antecedent period + intensity duration
-    lookback_hours = ANTECEDENT_PERIOD + INTENSITY_DURATION
-
     end_time = datetime.now(alaska_tz)
-    start_time = end_time - timedelta(hours=lookback_hours)
+    start_time = end_time - timedelta(hours=ANTECEDENT_PERIOD)
 
     # Synoptic API timeseries endpoint
     url = "https://api.synopticdata.com/v2/stations/timeseries"
@@ -126,64 +117,7 @@ def get_gauge_precipitation(place_name: str):
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
-        logger.debug(f"Synoptic API response: {data}")
-
-        if data.get("SUMMARY", {}).get("RESPONSE_CODE") != 1:
-            logger.error(
-                f"Synoptic API error for {gauge_id}: {data.get('SUMMARY', {}).get('RESPONSE_MESSAGE')}"
-            )
-            return None
-
-        stations = data.get("STATION", [])
-        if not stations:
-            logger.warning(f"No station data returned for {gauge_id}")
-            return None
-
-        observations = stations[0].get("OBSERVATIONS", {})
-        precip_data = observations.get("precip_accum_set_1", [])
-        timestamps = observations.get("date_time", [])
-
-        if not precip_data or not timestamps:
-            logger.warning(f"No precipitation data available for {gauge_id}")
-            return None
-
-        # Convert timestamps to datetime objects and pair with precipitation values
-        time_series = []
-        for ts_str, precip in zip(timestamps, precip_data):
-            if precip is not None:
-                dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=pytz.UTC
-                )
-                dt_alaska = dt.astimezone(alaska_tz)
-                time_series.append((dt_alaska, float(precip)))
-
-        if not time_series:
-            logger.warning(f"No valid precipitation data for {gauge_id}")
-            return None
-
-        # Calculate current intensity (last INTENSITY_DURATION hours)
-        intensity_start = end_time - timedelta(hours=INTENSITY_DURATION)
-        intensity_data = [p for dt, p in time_series if dt >= intensity_start]
-        current_intensity = sum(intensity_data) if intensity_data else 0.0
-
-        # Calculate antecedent periods
-        antecedent_values = {}
-        for period_hr in ANTECEDENT_PERIODS:
-            antecedent_start = intensity_start - timedelta(hours=period_hr)
-            antecedent_data = [
-                p for dt, p in time_series if antecedent_start <= dt < intensity_start
-            ]
-            antecedent_values[period_hr] = (
-                sum(antecedent_data) if antecedent_data else 0.0
-            )
-
-        return {
-            "intensity_mm": current_intensity,
-            "antecedent_24hr_mm": antecedent_values.get(24, 0.0),
-            "antecedent_48hr_mm": antecedent_values.get(48, 0.0),
-            "antecedent_72hr_mm": antecedent_values.get(72, 0.0),
-            "gauge_id": gauge_id,
-        }
+        print(data)
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching Synoptic data for {gauge_id}: {e}")
@@ -707,6 +641,8 @@ def lambda_handler(event, context):
                 logger.info(f"Processing {place_name}...")
 
                 # Placeholder values for gauge data (to be implemented later)
+                realtime = get_gauge_precipitation(place_name)
+                print(realtime)
                 realtime_rainfall_mm = None
                 gauge_id = None
                 realtime_antecedent = None
