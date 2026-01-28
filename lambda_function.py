@@ -61,13 +61,8 @@ def landslide_threshold(antecedent_mm: float) -> float:
     m = 14
     b = -0.05
 
-    # When the antecedent is very low, return a high threshold due to
-    # bad formula behavior
-    if antecedent_mm <= 0.01:
-        return 1000
-    else:
-        # y = m * x ** b
-        return m * antecedent_mm**b
+    # y = m * x ** b
+    return m * antecedent_mm**b
 
 
 def landslide_risk(rainfall_mm: float, threshold_upper: float) -> int:
@@ -259,7 +254,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
             historical_data[place_name] = []
 
         # This is the precipitation accumulated up to the previous timestep
-        running_precip_m = 0.0
+        running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
 
         # Generate timesteps at 3 hour intervals, which matches the ECMWF output frequency
         current_time = historical_start_time + timedelta(hours=3)
@@ -304,10 +299,12 @@ def get_historical_ecmwf_precipitation(forecast_time):
 
                         # Subtract running precipitation to get incremental precipitation.
                         # Convert to millimeters divided by 3 hour period to get intensity mm/hr
-                        precip_mm = ((precip_m - running_precip_m) * 1000) / 3
+                        precip_mm = (
+                            (precip_m - running_precip_m[place_name]) * 1000
+                        ) / 3
 
                         # Set running total precipitation for next iteration
-                        running_precip_m = precip_m
+                        running_precip_m[place_name] = precip_m
 
                         # Calculate timestamp in Alaska timezone
                         ts_alaska = current_time.astimezone(alaska_tz)
@@ -400,7 +397,7 @@ def get_forecast_precipitation(forecast_time):
 
         # This is the precipitation accumulated up to the previous timestep
         # Required to subtract this value to get incremental precipitation.
-        running_precip_m = 0.0
+        running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
 
         # Download each timestep we need (3h, 6h, 9h, up to 84h)
         # We need 84 hours to cover the full 72-hour forecast period with
@@ -447,10 +444,12 @@ def get_forecast_precipitation(forecast_time):
 
                         # Subtract running precipitation to get incremental precipitation.
                         # Convert to millimeters divided by 3 hour period to get intensity mm/hr
-                        precip_mm = ((precip_m - running_precip_m) * 1000) / 3
+                        precip_mm = (
+                            (precip_m - running_precip_m[place_name]) * 1000
+                        ) / 3
 
                         # Set running total for next iteration
-                        running_precip_m = precip_m
+                        running_precip_m[place_name] = precip_m
 
                         forecast_data[place_name].append(
                             {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
