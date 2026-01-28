@@ -61,12 +61,17 @@ ecmwf_bucket = "ecmwf-forecasts"
 def landslide_threshold(antecedent_mm: float) -> float:
     m = 14
     b = -0.05
-    # y = m * x ** b
-    return m * antecedent_mm**b
+
+    # When the antecedent is very low, return a high threshold due to
+    # bad formula behavior
+    if antecedent_mm <= 0.01:
+        return 1000
+    else:
+        # y = m * x ** b
+        return m * antecedent_mm**b
 
 
-def landslide_risk(rainfall_mm: float, antecedent_mm: float) -> int:
-    threshold_upper = landslide_threshold(antecedent_mm)
+def landslide_risk(rainfall_mm: float, threshold_upper: float) -> int:
     threshold_lower = threshold_upper / 2
     if rainfall_mm < threshold_lower:
         return 0
@@ -297,12 +302,13 @@ def get_historical_ecmwf_precipitation(forecast_time):
         # We choose a historical initialization time earlier than the historical start time
         # so that we have forecast data that cover that period.
         init_time = historical_start_time.replace(minute=0, second=0, microsecond=0)
-
-        if init_time.hour >= 12:
-            init_time = init_time.replace(hour=0)  # Use midnight of same day
+        if init_time.hour == 12:
+            init_time = historical_start_time.replace(
+                hour=0
+            )  # Use midnight of same day
         else:
             # If historical_start_time is before noon, go back to previous day's noon forecast output
-            init_time = (init_time - timedelta(days=1)).replace(hour=12)
+            init_time = (historical_start_time - timedelta(days=1)).replace(hour=12)
 
         logger.info(
             f"Using forecast initialized at {init_time.strftime('%Y-%m-%d %HZ')} for historical data"
@@ -313,10 +319,13 @@ def get_historical_ecmwf_precipitation(forecast_time):
         time_str = f"{init_time.hour:02d}z"
         base_path = f"{date_str}/{time_str}/ifs/0p25/oper"
 
-        # Calculate which forecast steps we need to cover [historical_start_time, forecast_time)
         historical_data = {}
+        # Not hard coded to allow for future additions of locations
         for place_name in LOCATIONS.keys():
             historical_data[place_name] = []
+
+        # This is the precipitation accumulated up to the previous timestep
+        running_precip_m = 0.0
 
         # Generate timesteps at 3 hour intervals, which matches the ECMWF output frequency
         current_time = historical_start_time + timedelta(hours=3)
@@ -331,10 +340,11 @@ def get_historical_ecmwf_precipitation(forecast_time):
                 f"Downloading historical step {hours_from_init}h from s3://{ecmwf_bucket}/{s3_key}"
             )
 
-            # Retry logic with exponential backoff for SlowDown errors
             max_retries = 5
-            retry_delay = 2  # Start with 2 seconds
+            retry_delay = 2
 
+            # Sometimes the S3 bucket returns SlowDown errors which require
+            # retrying the download so that we don't miss a step.
             for attempt in range(max_retries):
                 try:
                     ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
@@ -355,11 +365,15 @@ def get_historical_ecmwf_precipitation(forecast_time):
                             latitude=lat, longitude=lon, method="nearest"
                         )
 
-                        # Total precipitation is returned in meters, convert to millimeters
+                        # Total precipitation is returned in meters
                         precip_m = float(precip_values.values)
 
+                        # Subtract running precipitation to get incremental precipitation.
                         # Convert to millimeters divided by 3 hour period to get intensity mm/hr
-                        precip_mm = (precip_m * 1000) / 3
+                        precip_mm = ((precip_m - running_precip_m) * 1000) / 3
+
+                        # Set running total precipitation for next iteration
+                        running_precip_m = precip_m
 
                         # Calculate timestamp in Alaska timezone
                         ts_alaska = current_time.astimezone(alaska_tz)
@@ -374,7 +388,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
                     if os.path.exists(grib_file):
                         os.remove(grib_file)
 
-                    # Success - break out of retry loop
+                    # Break out of loop if we're successful
                     break
 
                 except Exception as e:
@@ -387,12 +401,14 @@ def get_historical_ecmwf_precipitation(forecast_time):
                                 f"retrying in {retry_delay}s..."
                             )
                             time.sleep(retry_delay)
-                            retry_delay *= 2  # Exponential backoff
+                            retry_delay *= 2
                         else:
                             logger.error(
                                 f"Error downloading/processing historical step {hours_from_init}h: {e}"
                             )
-                            break
+
+                            # If we can't get a timestep, abort
+                            return None
                     else:
                         logger.error(
                             f"Failed to download historical step {hours_from_init}h after {max_retries} attempts: {e}"
@@ -421,9 +437,9 @@ def get_historical_ecmwf_precipitation(forecast_time):
 
 def get_forecast_precipitation(forecast_time):
     """
-    Retrieve 72-hour ECMWF Open Data forecast precipitation for Craig and Kasaan.
+    Retrieve 84-hour ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
-    Only 500 connections allowed globally at the same time, so API access isn't great.
+    Data is available in 3 hour intervals starting at the 00 or 12 initialization of the model.
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
     # We save the forecast to S3 to save time on subsequent requests
@@ -444,10 +460,13 @@ def get_forecast_precipitation(forecast_time):
         time_str = f"{forecast_time.hour:02d}z"
         base_path = f"{date_str}/{time_str}/ifs/0p25/oper"
 
-        # Download individual timestep files and combine data
         forecast_data = {}
         for place_name in LOCATIONS.keys():
             forecast_data[place_name] = []
+
+        # This is the precipitation accumulated up to the previous timestep
+        # Required to subtract this value to get incremental precipitation.
+        running_precip_m = 0.0
 
         # Download each timestep we need (3h, 6h, 9h, up to 84h)
         # We need 84 hours to cover the full 72-hour forecast period with
@@ -460,10 +479,11 @@ def get_forecast_precipitation(forecast_time):
                 f"Downloading step {step_hours}h from s3://{ecmwf_bucket}/{s3_key}"
             )
 
-            # Retry logic with exponential backoff for SlowDown errors
             max_retries = 5
-            retry_delay = 2  # Start with 2 seconds
+            retry_delay = 2
 
+            # Sometimes the S3 bucket returns SlowDown errors which require
+            # retrying the download so that we don't miss a step.
             for attempt in range(max_retries):
                 try:
                     ecmwf_s3_client.download_file(ecmwf_bucket, s3_key, grib_file)
@@ -485,22 +505,18 @@ def get_forecast_precipitation(forecast_time):
                             latitude=lat, longitude=lon, method="nearest"
                         )
 
-                        if step_hours == 3:
-                            actual_lat = float(precip_values.latitude.values)
-                            actual_lon = float(precip_values.longitude.values)
-                            logger.info(
-                                f"{place_name}: requested ({lat}, {lon}), "
-                                f"using grid cell ({actual_lat}, {actual_lon})"
-                            )
-
                         ts = forecast_time + timedelta(hours=step_hours)
                         ts_alaska = ts.astimezone(alaska_tz)
 
-                        # Total precipitation is returned in meters, convert to millimeters
+                        # Total precipitation is returned in meters
                         precip_m = float(precip_values.values)
 
+                        # Subtract running precipitation to get incremental precipitation.
                         # Convert to millimeters divided by 3 hour period to get intensity mm/hr
-                        precip_mm = (precip_m * 1000) / 3
+                        precip_mm = ((precip_m - running_precip_m) * 1000) / 3
+
+                        # Set running total for next iteration
+                        running_precip_m = precip_m
 
                         forecast_data[place_name].append(
                             {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
@@ -512,7 +528,7 @@ def get_forecast_precipitation(forecast_time):
                     if os.path.exists(grib_file):
                         os.remove(grib_file)
 
-                    # Success - break out of retry loop
+                    # Break out of loop if we're successful
                     break
 
                 except Exception as e:
@@ -525,12 +541,14 @@ def get_forecast_precipitation(forecast_time):
                                 f"retrying in {retry_delay}s..."
                             )
                             time.sleep(retry_delay)
-                            retry_delay *= 2  # Exponential backoff
+                            retry_delay *= 2
                         else:
                             logger.error(
                                 f"Error downloading/processing step {step_hours}h: {e}"
                             )
-                            break
+
+                            # If we can't get a timestep, abort
+                            return None
                     else:
                         logger.error(
                             f"Failed to download step {step_hours}h after {max_retries} attempts: {e}"
@@ -553,20 +571,17 @@ def get_forecast_precipitation(forecast_time):
         return None
 
 
-def calculate_forecast_windows(forecast_time_series, historical_data=None):
+def calculate_forecast_blocks(forecast_data, historical_data):
     """
     Calculate intensity windows for the full 72-hour forecast period.
-    For each INTENSITY_DURATION period (e.g., 3 hours), calculate:
+    For each 3 hour period, calculate:
     - intensity_mm: rainfall in that discrete 3-hour period (single timestamp)
-    - antecedent_mm: sum of previous INTENSITY_DURATION periods within ANTECEDENT_PERIOD lookback
+    - antecedent_mm: sum of previous 3 hour periods within ANTECEDENT_PERIOD lookback
 
-    If historical_data is provided, it is prepended to forecast_time_series to provide
+    Historical data is prepended to forecast_data to provide
     complete antecedent coverage from the first forecast timestep.
     Returns single array with all forecast timesteps.
-    Risk is calculated from intensity only.
     """
-    if not forecast_time_series:
-        return []
 
     # Combine historical and forecast data
     combined_data = []
@@ -577,7 +592,7 @@ def calculate_forecast_windows(forecast_time_series, historical_data=None):
         combined_data.append((timestamp, hindcast["precip_mm"]))
 
     # Add forecast data
-    for forecast in forecast_time_series:
+    for forecast in forecast_data:
         timestamp = datetime.fromisoformat(forecast["timestamp"])
         combined_data.append((timestamp, forecast["precip_mm"]))
 
@@ -588,35 +603,33 @@ def calculate_forecast_windows(forecast_time_series, historical_data=None):
     historical_count = len(historical_data)
 
     # Calculate how many timesteps fit in antecedent period
-    timesteps_in_antecedent = ANTECEDENT_PERIOD // INTENSITY_DURATION
+    timesteps_in_antecedent = ANTECEDENT_PERIOD // 3
 
-    forecast_windows = []
+    forecast_blocks = []
 
     # Process only the forecast portion of the data
     for i in range(historical_count, len(combined_data)):
-        window_end_time = combined_data[i][0]
+        block_end_time = combined_data[i][0]
 
-        # Intensity is ONLY the current 3-hour period (current timestamp)
+        # Intensity is ONLY the current 3-hour period
         intensity_mm = combined_data[i][1]
 
         # Calculate antecedent: sum of previous timesteps within lookback window
         # With historical data prepended, we now have full antecedent coverage
-
-        # Full antecedent period available: sliding window
         lookback_start_index = i - timesteps_in_antecedent
         antecedent_mm = sum(
             precip for dt, precip in combined_data[lookback_start_index:i]
         )
 
         landslide_threshold_upper = landslide_threshold(antecedent_mm)
-        landslide_risk_level = landslide_risk(intensity_mm, antecedent_mm)
+        landslide_risk_level = landslide_risk(intensity_mm, landslide_threshold_upper)
 
         # Calculate forecast hour (hours from forecast start, excluding historical)
-        forecast_hour = (i - historical_count + 1) * INTENSITY_DURATION
+        forecast_hour = ((i + 1) - historical_count) * 3
 
-        forecast_windows.append(
+        forecast_blocks.append(
             {
-                "timestamp": window_end_time.isoformat(),
+                "timestamp": block_end_time.isoformat(),
                 "forecast_hour": forecast_hour,
                 "intensity_mm": round(intensity_mm, 2),
                 "antecedent_mm": round(antecedent_mm, 2),
@@ -625,7 +638,7 @@ def calculate_forecast_windows(forecast_time_series, historical_data=None):
             }
         )
 
-    return forecast_windows
+    return forecast_blocks
 
 
 def get_places_from_event(event) -> list[str]:
@@ -694,16 +707,16 @@ def lambda_handler(event, context):
                 logger.info(f"Processing {place_name}...")
 
                 # Placeholder values for gauge data (to be implemented later)
-                rainfall_mm = None
+                realtime_rainfall_mm = None
                 gauge_id = None
                 realtime_antecedent = None
-                landslide_threshold_upper = None
-                landslide_risk_level = None
+                realtime_threshold_upper = None
+                realtime_risk_level = None
 
-                # Calculate forecast windows for this location
-                forecast_windows = None
+                # Calculate forecast blocks for this location
+                forecast_blocks = None
 
-                if forecast_data and place_name in forecast_data:
+                if place_name in forecast_data:
                     current_location_forecast = forecast_data[place_name]
 
                     # Get historical data for this location if available
@@ -711,55 +724,44 @@ def lambda_handler(event, context):
                     if historical_data and place_name in historical_data:
                         current_location_historical = historical_data[place_name]
 
-                    windows_array = calculate_forecast_windows(
+                    blocks_array = calculate_forecast_blocks(
                         current_location_forecast, current_location_historical
                     )
 
                     # Calculate current forecast hour based on time since initialization
                     hours_since_init = (now - forecast_time).total_seconds() / 3600
-                    current_forecast_hour = (
-                        math.ceil(hours_since_init / INTENSITY_DURATION)
-                        * INTENSITY_DURATION
-                    )
-
-                    # Special case: if exactly on a 3-hour boundary, use that hour
-                    if (
-                        hours_since_init % INTENSITY_DURATION == 0
-                        and hours_since_init > 0
-                    ):
-                        current_forecast_hour = int(hours_since_init)
+                    current_forecast_hour = math.ceil(hours_since_init / 3) * 3
 
                     # Filter to rolling 72-hour window starting from current time
-                    rolling_windows = [
-                        window
-                        for window in windows_array
-                        if window["forecast_hour"] >= current_forecast_hour
+                    rolling_72hr_blocks = [
+                        block
+                        for block in blocks_array
+                        if block["forecast_hour"] >= current_forecast_hour
                     ][
                         :24
-                    ]  # 24 windows = 72 hours
+                    ]  # 24 blocks = 72 hours
 
                     logger.info(
-                        f"Rolling forecast window: {len(rolling_windows)} windows from hour {current_forecast_hour}"
+                        f"Rolling forecast window: {len(rolling_72hr_blocks)} windows from hour {current_forecast_hour}"
                     )
-                    if rolling_windows:
+                    if rolling_72hr_blocks:
                         logger.info(
-                            f"First window: hour {rolling_windows[0]['forecast_hour']} ending at {rolling_windows[0]['timestamp']}"
+                            f"First window: hour {rolling_72hr_blocks[0]['forecast_hour']} ending at {rolling_72hr_blocks[0]['timestamp']}"
                         )
                         logger.info(
-                            f"Last window: hour {rolling_windows[-1]['forecast_hour']} ending at {rolling_windows[-1]['timestamp']}"
+                            f"Last window: hour {rolling_72hr_blocks[-1]['forecast_hour']} ending at {rolling_72hr_blocks[-1]['timestamp']}"
                         )
 
                     # Convert to JSON string for PSQL JSONB column
-                    forecast_windows = json.dumps(rolling_windows)
-
+                    forecast_blocks = json.dumps(rolling_72hr_blocks)
                 place_id = get_place_id(place_name)
 
                 sql = """
-                INSERT INTO kuti_test (
+                INSERT INTO landslide_risk (
                   ts, place_name, place_id, expires_at,
-                  rainfall_mm, risk_prob, risk_level,
+                  realtime_rainfall_mm, realtime_threshold_upper, realtime_risk_level,
                   gauge_id, realtime_antecedent_mm,
-                  forecast_windows
+                  forecast_blocks
                 ) VALUES (
                   %s, %s, %s, %s,
                   %s, %s, %s,
@@ -773,12 +775,12 @@ def lambda_handler(event, context):
                         place_name,
                         place_id,
                         expires_at_str,
-                        rainfall_mm,
-                        landslide_threshold_upper,
-                        landslide_risk_level,
+                        realtime_rainfall_mm,
+                        realtime_threshold_upper,
+                        realtime_risk_level,
                         gauge_id,
                         realtime_antecedent,
-                        forecast_windows,
+                        forecast_blocks,
                     ),
                 )
 
