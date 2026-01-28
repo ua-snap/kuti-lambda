@@ -8,6 +8,8 @@ import xarray as xr
 import pytz
 import pg8000
 import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
 import requests
 import time
 
@@ -53,7 +55,9 @@ LOCATIONS = {
 alaska_tz = pytz.timezone("US/Alaska")
 
 s3_client = boto3.client("s3") if S3_BUCKET_NAME else None
-ecmwf_s3_client = boto3.client("s3", region_name="eu-central-1")
+ecmwf_s3_client = boto3.client(
+    "s3", region_name="eu-central-1", config=Config(signature_version=UNSIGNED)
+)
 ecmwf_bucket = "ecmwf-forecasts"
 
 
@@ -642,11 +646,13 @@ def lambda_handler(event, context):
                 # Placeholder values for gauge data (to be implemented later)
                 realtime = get_gauge_precipitation(place_name)
                 print(realtime)
-                realtime_rainfall_mm = None
-                gauge_id = None
-                realtime_antecedent = None
-                realtime_threshold_upper = None
-                realtime_risk_level = None
+                realtime_rainfall_mm = 0.1
+                gauge_id = LOCATIONS[place_name]["gauge_id"]
+                realtime_antecedent = 5.0
+                realtime_threshold_upper = landslide_threshold(realtime_antecedent)
+                realtime_risk_level = landslide_risk(
+                    realtime_rainfall_mm, realtime_threshold_upper
+                )
 
                 # Calculate forecast blocks for this location
                 forecast_blocks = None

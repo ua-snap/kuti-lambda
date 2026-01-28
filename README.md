@@ -29,59 +29,50 @@ CREATE INDEX idx_landslide_risk_ts ON landslide_risk (ts DESC);
 
 ```
 
-## Importing into Lambda
+## Deploying to Lambda
 
-### Step 1: Install Dependencies
+This function uses a Docker container image for deployment due to the large size of dependencies (>400MB). Be sure to have Docker running locally on your system.
 
-```bash
-pip install -r requirements.txt -t python_deps/python/
-```
+### Step 1: Build Docker Image
 
-### Step 2: Create and Upload Lambda Layer
-
-Zip the dependencies into a Lambda Layer:
+Build the Docker image for Linux/AMD64 platform (required for Lambda):
 
 ```bash
-cd python_deps && zip -r ../lambda-layer.zip python/ && cd ..
+docker build --platform linux/amd64 -t kuti-landslide:latest .
 ```
 
-Upload the layer to AWS:
+### Step 2: Login to ECR
+
+Authenticate Docker to your Amazon ECR registry:
 
 ```bash
-aws lambda publish-layer-version \
-  --layer-name kuti-dependencies \
-  --description "Dependencies for Landslide Risk Lambda" \
-  --zip-file fileb://lambda-layer.zip \
-  --compatible-runtimes python3.11 python3.12
+aws ecr get-login-password --region us-west-2 | \
+  docker login --username AWS --password-stdin \
+  904506553012.dkr.ecr.us-west-2.amazonaws.com
 ```
 
-Note the `LayerVersionArn` from the output (you'll need it in Step 4).
+### Step 3: Tag and Push Image
 
-### Step 3: Update Lambda Function Code
-
-Zip only the function code (without dependencies):
+Tag the image and push to ECR:
 
 ```bash
-zip lambda_function.zip lambda_function.py
+docker tag kuti-landslide:latest \
+  904506553012.dkr.ecr.us-west-2.amazonaws.com/kuti-landslide:latest
+
+docker push 904506553012.dkr.ecr.us-west-2.amazonaws.com/kuti-landslide:latest
 ```
 
-Update the Lambda function:
+### Step 4: Update Lambda Function
+
+Update the Lambda function with the new image:
 
 ```bash
-aws lambda update-function-code --function-name Landslide_Risk_Insert --zip-file fileb://lambda_function.zip
+aws lambda update-function-code \
+  --function-name Kuti_Insert \
+  --image-uri 904506553012.dkr.ecr.us-west-2.amazonaws.com/kuti-landslide:latest
 ```
 
-### Step 4: Attach Layer to Function
-
-Replace `<LayerVersionArn>` with the ARN from Step 2:
-
-```bash
-aws lambda update-function-configuration \
-  --function-name Landslide_Risk_Insert \
-  --layers <LayerVersionArn>
-```
-
-Example: `arn:aws:lambda:us-west-2:123456789012:layer:kuti-dependencies:1`
+**NOTE:** The function will automatically use the updated image on the next invocation.
 
 ## Update Lambda run time
 
@@ -99,8 +90,23 @@ aws events describe-rule --name Landslide_Risk_Event
 
 ## Running the Lambda function locally
 
-If you want to run the Lambda function locally, you can use the downloaded Python dependencies by running the following command from this directory:
+If you want to run the Lambda function locally, you can use Micromamba to
+create a new environment for this project:
+
+### Step 1: Create Micromamba Environment
+
+Create a new environment with the required dependencies:
 
 ```bash
-PYTHONPATH=python_deps/python python lambda_function.py
+micromamba create -n kuti-lambda python=3.12 -y
+micromamba activate kuti-lambda
+pip install -r requirements.txt
+```
+
+### Step 2: Run the Lambda Function
+
+With the environment activated:
+
+```bash
+python lambda_function.py
 ```
