@@ -91,35 +91,62 @@ def get_gauge_precipitation(place_name: str):
         return None
 
     location_info = LOCATIONS.get(place_name)
-
     gauge_id = location_info["gauge_id"]
 
-    # TODO: Figure out what needs to come out of Synoptic when I have
-    # access to the API.
-    # Calculate time window: need max antecedent period + intensity duration
-    end_time = datetime.now(alaska_tz)
-    start_time = end_time - timedelta(hours=ANTECEDENT_PERIOD)
-
-    # Synoptic API timeseries endpoint
-    url = "https://api.synopticdata.com/v2/stations/timeseries"
-    params = {
-        "token": SYNOPTIC_API_TOKEN,
-        "stid": gauge_id,
-        "network": "293",
-        "start": start_time.strftime("%Y%m%d%H%M"),
-        "end": end_time.strftime("%Y%m%d%H%M"),
-        "vars": "precip_accum",
-        "units": "metric",
-    }
-
     try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        print(data)
+        # Get current precipitation
+        latest_url = "https://api.synopticdata.com/v2/stations/latest"
+        latest_params = {
+            "token": SYNOPTIC_API_TOKEN,
+            "stid": gauge_id,
+            "vars": "precip_interval",
+        }
+
+        logger.info(f"Fetching current precipitation for {gauge_id}...")
+        latest_response = requests.get(latest_url, params=latest_params, timeout=30)
+        latest_response.raise_for_status()
+        latest_data = latest_response.json()
+
+        # Extract current precipitation
+        current_precip = latest_data["STATION"][0]["OBSERVATIONS"][
+            "precip_interval_value_1"
+        ]["value"]
+        logger.info(f"Current precipitation for {gauge_id}: {current_precip} mm")
+
+        # Get 24-hour accumulated precipitation
+        timeseries_url = "https://api.synopticdata.com/v2/stations/timeseries"
+        timeseries_params = {
+            "token": SYNOPTIC_API_TOKEN,
+            "stid": gauge_id,
+            "recent": "1440",
+            "precip": "1",
+        }
+
+        logger.info(f"Fetching 24-hour precipitation for {gauge_id}...")
+        timeseries_response = requests.get(
+            timeseries_url, params=timeseries_params, timeout=30
+        )
+        timeseries_response.raise_for_status()
+        timeseries_data = timeseries_response.json()
+
+        # Extract 24-hour accumulated precipitation
+        antecedent_precip = timeseries_data["STATION"][0]["OBSERVATIONS"][
+            "precip_accumulated_set_1d"
+        ][-1]
+        logger.info(
+            f"24-hour accumulated precipitation for {gauge_id}: {antecedent_precip} mm"
+        )
+
+        return {
+            "current_precip_mm": current_precip,
+            "antecedent_precip_mm": antecedent_precip,
+        }
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching Synoptic data for {gauge_id}: {e}")
+        return None
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"Error parsing Synoptic data for {gauge_id}: {e}")
         return None
     except Exception as e:
         logger.exception(f"Unexpected error processing Synoptic data for {gauge_id}")
@@ -643,12 +670,23 @@ def lambda_handler(event, context):
             for place_name in places_to_run:
                 logger.info(f"Processing {place_name}...")
 
-                # Placeholder values for gauge data (to be implemented later)
-                realtime = get_gauge_precipitation(place_name)
-                print(realtime)
-                realtime_rainfall_mm = 0.1
+                # Get real-time gauge precipitation data
+                gauge_data = get_gauge_precipitation(place_name)
+
+                if gauge_data is None:
+                    logger.error(
+                        f"No Synoptic gauge data available for {place_name}, aborting processing."
+                    )
+                    conn.close()
+                    return {
+                        "status": "error",
+                        "message": f"No Synoptic gauge data available for {place_name}",
+                        "timestamp": now.isoformat(),
+                    }
+
+                realtime_rainfall_mm = gauge_data["current_precip_mm"]
+                realtime_antecedent = gauge_data["antecedent_precip_mm"]
                 gauge_id = LOCATIONS[place_name]["gauge_id"]
-                realtime_antecedent = 5.0
                 realtime_threshold_upper = landslide_threshold(realtime_antecedent)
                 realtime_risk_level = landslide_risk(
                     realtime_rainfall_mm, realtime_threshold_upper
