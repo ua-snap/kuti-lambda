@@ -13,11 +13,6 @@ from botocore.config import Config
 import requests
 import time
 
-# ECMWF OpenData client, though we use S3 access directly to avoid rate limits
-# May consider coming back to this later per suggestion
-from ecmwf.opendata import Client
-from ecmwfapi import ECMWFService
-
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -249,11 +244,6 @@ def get_historical_ecmwf_precipitation(forecast_time):
     """
     historical_start_time = forecast_time - timedelta(hours=ANTECEDENT_PERIOD)
 
-    # Check S3 cache first
-    cached_data = check_s3_historical_cache(historical_start_time, forecast_time)
-    if cached_data:
-        return cached_data
-
     try:
         logger.info(
             f"Downloading historical ECMWF data from S3: {historical_start_time.strftime('%Y-%m-%d %HZ')} to {forecast_time.strftime('%Y-%m-%d %HZ')}"
@@ -384,9 +374,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
 
             current_time += timedelta(hours=3)
 
-        # Cache the results to S3 since the data needed won't change for 12 hours
         if historical_data and any(historical_data.values()):
-            cache_s3_historical(historical_start_time, forecast_time, historical_data)
             return historical_data
         else:
             logger.error("No historical data retrieved")
@@ -404,11 +392,6 @@ def get_forecast_precipitation(forecast_time):
     Data is available in 3 hour intervals starting at the 00 or 12 initialization of the model.
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
-    # We save the forecast to S3 to save time on subsequent requests
-    # Check for the most recent forecast before downloading it.
-    cached_forecast = check_s3_forecast_cache(forecast_time)
-    if cached_forecast:
-        return cached_forecast
 
     # Download from ECMWF's public S3 bucket instead of using rate-limited API
     try:
@@ -523,10 +506,6 @@ def get_forecast_precipitation(forecast_time):
 
                         # If we can't get a timestep, abort
                         return None
-
-        # Save forecast data to S3 for reference within the 12 hour
-        # window between model run outputs.
-        save_forecast_to_s3(forecast_time, forecast_data)
 
         return forecast_data
 
