@@ -633,14 +633,14 @@ def lambda_handler(event, context):
 
                 sql = """
                 INSERT INTO landslide_risk (
-                  ts, place_name, place_id, expires_at,
-                  realtime_rainfall_mm, realtime_threshold_upper, realtime_risk_level,
-                  gauge_id, realtime_antecedent_mm,
-                  forecast_blocks
+                ts, place_name, place_id, expires_at,
+                realtime_rainfall_mm, realtime_threshold_upper, realtime_risk_level,
+                gauge_id, realtime_antecedent_mm, antecedent_period,
+                forecast_blocks
                 ) VALUES (
-                  %s, %s, %s, %s,
-                  %s, %s, %s,
-                  %s, %s, %s
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s
                 )
                 """
                 cur.execute(
@@ -655,6 +655,7 @@ def lambda_handler(event, context):
                         realtime_risk_level,
                         gauge_id,
                         realtime_antecedent,
+                        ANTECEDENT_PERIOD,
                         forecast_blocks,
                     ),
                 )
