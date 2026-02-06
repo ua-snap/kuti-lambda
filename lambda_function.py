@@ -108,28 +108,32 @@ def get_gauge_precipitation(place_name: str):
         ]["value"]
         logger.info(f"Current precipitation for {gauge_id}: {current_precip} mm")
 
-        # Get 24-hour accumulated precipitation
+        antecedent_minutes = ANTECEDENT_PERIOD * 60
+
+        # Fetch ANTECEDENT_PERIOD hours of accumulated precipitation
         timeseries_url = "https://api.synopticdata.com/v2/stations/timeseries"
         timeseries_params = {
             "token": SYNOPTIC_API_TOKEN,
             "stid": gauge_id,
-            "recent": "1440",
+            "recent": str(antecedent_minutes),
             "precip": "1",
         }
 
-        logger.info(f"Fetching 24-hour precipitation for {gauge_id}...")
+        logger.info(
+            f"Fetching {ANTECEDENT_PERIOD}-hour precipitation for {gauge_id}..."
+        )
         timeseries_response = requests.get(
             timeseries_url, params=timeseries_params, timeout=30
         )
         timeseries_response.raise_for_status()
         timeseries_data = timeseries_response.json()
 
-        # Extract 24-hour accumulated precipitation
+        # Extract ANTECEDENT_PERIOD hours of accumulated precipitation
         antecedent_precip = timeseries_data["STATION"][0]["OBSERVATIONS"][
             "precip_accumulated_set_1d"
         ][-1]
         logger.info(
-            f"24-hour accumulated precipitation for {gauge_id}: {antecedent_precip} mm"
+            f"{ANTECEDENT_PERIOD}-hour accumulated precipitation for {gauge_id}: {antecedent_precip} mm"
         )
 
         return {
