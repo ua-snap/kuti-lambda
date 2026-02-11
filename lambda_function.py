@@ -42,8 +42,18 @@ ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
 # Location coordinates (lat, lon) for nearest grid cell lookup
 LOCATIONS = {
-    "Craig": {"lat": 55.48, "lon": -133.15, "gauge_id": "CRGA2"},
-    "Kasaan": {"lat": 55.54, "lon": -132.40, "gauge_id": "SMKAS"},
+    "Craig": {
+        "lat": 55.48,
+        "lon": -133.15,
+        "gauge_id": "CRGA2",
+        "var": "precip_accum_one_hour",
+    },
+    "Kasaan": {
+        "lat": 55.54,
+        "lon": -132.40,
+        "gauge_id": "SMKAS",
+        "var": "precip_interval",
+    },
 }
 
 alaska_tz = pytz.timezone("US/Alaska")
@@ -97,7 +107,7 @@ def get_gauge_precipitation(place_name: str):
         latest_params = {
             "token": SYNOPTIC_API_TOKEN,
             "stid": gauge_id,
-            "vars": "precip_interval",
+            "vars": location_info["var"],
         }
 
         logger.info(f"Fetching current precipitation for {gauge_id}...")
@@ -107,7 +117,7 @@ def get_gauge_precipitation(place_name: str):
 
         # Extract current precipitation
         current_precip = latest_data["STATION"][0]["OBSERVATIONS"][
-            "precip_interval_value_1"
+            f"{location_info['var']}_value_1"
         ]["value"]
         logger.info(f"Current precipitation for {gauge_id}: {current_precip} mm")
 
