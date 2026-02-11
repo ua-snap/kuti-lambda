@@ -38,12 +38,11 @@ SYNOPTIC_API_TOKEN = os.environ.get("SYNOPTIC_API_TOKEN")
 S3_BUCKET_NAME = "kuti-forecast-data"
 S3_CACHE_PREFIX = os.environ.get("S3_CACHE_PREFIX", "ecmwf-cache")
 
-# Configurable parameters
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
 # Location coordinates (lat, lon) for nearest grid cell lookup
 LOCATIONS = {
-    "Craig": {"lat": 55.48, "lon": -133.15, "gauge_id": "CSMA2"},
+    "Craig": {"lat": 55.48, "lon": -133.15, "gauge_id": "CRGA2"},
     "Kasaan": {"lat": 55.54, "lon": -132.40, "gauge_id": "SMKAS"},
 }
 
