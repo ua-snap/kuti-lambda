@@ -59,6 +59,10 @@ def landslide_threshold(antecedent_mm: float) -> float:
     m = 14
     b = -0.05
 
+    # If antecedent is zero, return the base threshold value
+    if antecedent_mm == 0.0:
+        return m
+
     # y = m * x ** b
     return m * antecedent_mm**b
 
