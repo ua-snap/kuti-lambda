@@ -9,6 +9,14 @@ DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 DB_NAME = os.environ["DB_NAME"]
 
+# Mathematical safety constants
+# Z_OVERFLOW_THRESHOLD: Safe margin below math.exp() overflow point (~710)
+# to prevent OverflowError in probability calculations
+Z_OVERFLOW_THRESHOLD = 700
+# MAX_VALID_RAINFALL_MM: Physical upper limit for 3-hour rainfall
+# Values above this are clamped to prevent overflow in calculations
+MAX_VALID_RAINFALL_MM = 2000
+
 
 def landslide_probability(rainfall_mm: float) -> float:
     intercept = -13.7821
@@ -16,9 +24,9 @@ def landslide_probability(rainfall_mm: float) -> float:
     z = intercept + coefficient * rainfall_mm
     # Prevent overflow in exp() calculation
     # exp() overflows around z=710, which corresponds to ~1686mm rainfall
-    if z > 700:
+    if z > Z_OVERFLOW_THRESHOLD:
         return 1.0  # Probability approaches 1 for very high z
-    elif z < -700:
+    elif z < -Z_OVERFLOW_THRESHOLD:
         return 0.0  # Probability approaches 0 for very low z
     exp_z = math.exp(z)
     return exp_z / (1 + exp_z)
@@ -95,8 +103,8 @@ def lambda_handler(event, context):
                 # Negative values are invalid; extreme values (>2000mm/3hr) are physically unlikely
                 if rainfall_mm < 0:
                     rainfall_mm = 0.0
-                elif rainfall_mm > 2000:
-                    rainfall_mm = 2000.0
+                elif rainfall_mm > MAX_VALID_RAINFALL_MM:
+                    rainfall_mm = MAX_VALID_RAINFALL_MM
 
                 prob = landslide_probability(rainfall_mm)
                 risk = landslide_risk(rainfall_mm)
