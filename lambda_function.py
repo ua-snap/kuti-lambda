@@ -14,6 +14,12 @@ def landslide_probability(rainfall_mm: float) -> float:
     intercept = -13.7821
     coefficient = 0.4294
     z = intercept + coefficient * rainfall_mm
+    # Prevent overflow in exp() calculation
+    # exp() overflows around z=710, which corresponds to ~1686mm rainfall
+    if z > 700:
+        return 1.0  # Probability approaches 1 for very high z
+    elif z < -700:
+        return 0.0  # Probability approaches 0 for very low z
     return math.exp(z) / (1 + math.exp(z))
 
 
@@ -83,6 +89,13 @@ def lambda_handler(event, context):
         with conn.cursor() as cur:
             for place_name in places_to_run:
                 rainfall_mm = get_rainfall_last_3h(place_name)
+                
+                # Validate rainfall values to prevent mathematical errors
+                # Negative values are invalid; extreme values (>2000mm/3hr) are physically unlikely
+                if rainfall_mm < 0:
+                    rainfall_mm = 0.0
+                elif rainfall_mm > 2000:
+                    rainfall_mm = 2000.0
 
                 prob = landslide_probability(rainfall_mm)
                 risk = landslide_risk(rainfall_mm)
