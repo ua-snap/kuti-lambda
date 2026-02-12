@@ -20,7 +20,8 @@ def landslide_probability(rainfall_mm: float) -> float:
         return 1.0  # Probability approaches 1 for very high z
     elif z < -700:
         return 0.0  # Probability approaches 0 for very low z
-    return math.exp(z) / (1 + math.exp(z))
+    exp_z = math.exp(z)
+    return exp_z / (1 + exp_z)
 
 
 def landslide_risk(rainfall_mm: float) -> int:
