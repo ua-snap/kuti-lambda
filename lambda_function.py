@@ -22,8 +22,9 @@ def landslide_probability(rainfall_mm: float) -> float:
     intercept = -13.7821
     coefficient = 0.4294
     z = intercept + coefficient * rainfall_mm
-    # Prevent overflow in exp() calculation
-    # exp() overflows around z=710, which corresponds to ~1686mm rainfall
+    # Prevent overflow/underflow in exp() calculation
+    # Upper bound: exp() overflows around z=710, which corresponds to ~1686mm rainfall
+    # Lower bound: For efficiency, return 0.0 early when exp(z) would underflow
     if z > Z_OVERFLOW_THRESHOLD:
         return 1.0  # Probability approaches 1 for very high z
     elif z < -Z_OVERFLOW_THRESHOLD:
@@ -100,6 +101,8 @@ def lambda_handler(event, context):
                 rainfall_mm = get_rainfall_last_3h(place_name)
                 
                 # Validate rainfall values to prevent mathematical errors
+                # NOTE: Silent clamping is used here. In production, consider logging
+                # clamped values to detect sensor errors or data quality issues.
                 # Negative values are invalid; extreme values (>2000mm/3hr) are physically unlikely
                 if rainfall_mm < 0:
                     rainfall_mm = 0.0
