@@ -51,7 +51,7 @@ LOCATIONS = {
     "Kasaan": {
         "lat": 55.54,
         "lon": -132.40,
-        "gauge_id": "SMKAS",
+        "gauge_id": "PWKA2",
         "var": "precip_interval",
     },
 }
@@ -69,8 +69,8 @@ def landslide_threshold(antecedent_mm: float) -> float:
     m = 14
     b = -0.05
 
-    # If antecedent is zero, return the base threshold value
-    if antecedent_mm == 0.0:
+    # If antecedent is zero or negative, return the base threshold value
+    if antecedent_mm <= 0.0:
         return m
 
     # y = m * x ** b
@@ -254,6 +254,14 @@ def get_historical_ecmwf_precipitation(forecast_time):
                             (precip_m - running_precip_m[place_name]) * 1000
                         ) / 3
 
+                        if precip_mm < 0:
+                            logger.warning(
+                                f"Negative historical precipitation detected for {place_name} at {current_time}: "
+                                f"precip_mm={precip_mm:.4f}, precip_m={precip_m:.6f}, running={running_precip_m[place_name]:.6f}. "
+                                f"Setting to 0.0"
+                            )
+                            precip_mm = 0.0
+
                         # Set running total precipitation for next iteration
                         running_precip_m[place_name] = precip_m
 
@@ -391,6 +399,14 @@ def get_forecast_precipitation(forecast_time):
                         precip_mm = (
                             (precip_m - running_precip_m[place_name]) * 1000
                         ) / 3
+
+                        if precip_mm < 0:
+                            logger.warning(
+                                f"Negative forecast precipitation detected for {place_name} at step {step_hours}h: "
+                                f"precip_mm={precip_mm:.4f}, precip_m={precip_m:.6f}, running={running_precip_m[place_name]:.6f}. "
+                                f"Setting to 0.0"
+                            )
+                            precip_mm = 0.0
 
                         # Set running total for next iteration
                         running_precip_m[place_name] = precip_m
