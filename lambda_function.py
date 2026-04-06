@@ -3,6 +3,7 @@ import math
 import json
 import logging
 from datetime import datetime, timedelta
+import random
 import cfgrib
 import xarray as xr
 import pytz
@@ -10,6 +11,7 @@ import pg8000
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
+from botocore.exceptions import ClientError
 import requests
 import time
 
@@ -221,7 +223,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
             )
 
             max_retries = 5
-            retry_delay = 2
+            base_retry_delay = 3  # Increased from 2
 
             # Sometimes the S3 bucket returns SlowDown errors which require
             # retrying the download so that we don't miss a step.
@@ -278,25 +280,32 @@ def get_historical_ecmwf_precipitation(forecast_time):
                     if os.path.exists(grib_file):
                         os.remove(grib_file)
 
+                    # Add a small delay between successful downloads to avoid rate limiting
+                    time.sleep(0.5 + random.uniform(0, 0.5))  # 0.5-1.0 second delay
+
                     # Break out of loop if we're successful
                     break
 
-                except Exception as e:
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "")
                     if attempt < max_retries - 1:
-                        # Check if it's a SlowDown error
-                        error_str = str(e)
-                        if "SlowDown" in error_str or "503" in error_str:
+                        # Check if it's a SlowDown or rate limit error
+                        if error_code in ["SlowDown", "ServiceUnavailable", "503"]:
+                            # Exponential backoff with jitter
+                            retry_delay = base_retry_delay * (2**attempt)
+                            jitter = random.uniform(
+                                0, retry_delay * 0.3
+                            )  # Add up to 30% jitter
+                            total_delay = retry_delay + jitter
                             logger.warning(
                                 f"SlowDown error on historical step {hours_from_init}h (attempt {attempt + 1}/{max_retries}), "
-                                f"retrying in {retry_delay}s..."
+                                f"retrying in {total_delay:.1f}s..."
                             )
-                            time.sleep(retry_delay)
-                            retry_delay *= 2
+                            time.sleep(total_delay)
                         else:
                             logger.error(
-                                f"Error downloading/processing historical step {hours_from_init}h: {e}"
+                                f"Error downloading historical step {hours_from_init}h: {e}"
                             )
-
                             # If we can't get a timestep, abort
                             return None
                     else:
@@ -306,7 +315,35 @@ def get_historical_ecmwf_precipitation(forecast_time):
                         # Clean up partial file if it exists
                         if os.path.exists(grib_file):
                             os.remove(grib_file)
-
+                        # If we can't get a timestep, abort
+                        return None
+                except Exception as e:
+                    error_str = str(e)
+                    if attempt < max_retries - 1:
+                        # Check if it's a SlowDown error in the error string
+                        if "SlowDown" in error_str or "503" in error_str:
+                            # Exponential backoff with jitter
+                            retry_delay = base_retry_delay * (2**attempt)
+                            jitter = random.uniform(0, retry_delay * 0.3)
+                            total_delay = retry_delay + jitter
+                            logger.warning(
+                                f"SlowDown error on historical step {hours_from_init}h (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {total_delay:.1f}s..."
+                            )
+                            time.sleep(total_delay)
+                        else:
+                            logger.error(
+                                f"Error processing historical step {hours_from_init}h: {e}"
+                            )
+                            # If we can't get a timestep, abort
+                            return None
+                    else:
+                        logger.error(
+                            f"Failed to download historical step {hours_from_init}h after {max_retries} attempts: {e}"
+                        )
+                        # Clean up partial file if it exists
+                        if os.path.exists(grib_file):
+                            os.remove(grib_file)
                         # If we can't get a timestep, abort
                         return None
 
@@ -363,7 +400,7 @@ def get_forecast_precipitation(forecast_time):
             )
 
             max_retries = 5
-            retry_delay = 2
+            base_retry_delay = 3  # Increased from 2
 
             # Sometimes the S3 bucket returns SlowDown errors which require
             # retrying the download so that we don't miss a step.
@@ -421,25 +458,30 @@ def get_forecast_precipitation(forecast_time):
                     if os.path.exists(grib_file):
                         os.remove(grib_file)
 
+                    # Add a small delay between successful downloads to avoid rate limiting
+                    time.sleep(0.5 + random.uniform(0, 0.5))  # 0.5-1.0 second delay
+
                     # Break out of loop if we're successful
                     break
 
-                except Exception as e:
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "")
                     if attempt < max_retries - 1:
-                        # Check if it's a SlowDown error
-                        error_str = str(e)
-                        if "SlowDown" in error_str or "503" in error_str:
+                        # Check if it's a SlowDown or rate limit error
+                        if error_code in ["SlowDown", "ServiceUnavailable", "503"]:
+                            # Exponential backoff with jitter
+                            retry_delay = base_retry_delay * (2**attempt)
+                            jitter = random.uniform(
+                                0, retry_delay * 0.3
+                            )  # Add up to 30% jitter
+                            total_delay = retry_delay + jitter
                             logger.warning(
                                 f"SlowDown error on step {step_hours}h (attempt {attempt + 1}/{max_retries}), "
-                                f"retrying in {retry_delay}s..."
+                                f"retrying in {total_delay:.1f}s..."
                             )
-                            time.sleep(retry_delay)
-                            retry_delay *= 2
+                            time.sleep(total_delay)
                         else:
-                            logger.error(
-                                f"Error downloading/processing step {step_hours}h: {e}"
-                            )
-
+                            logger.error(f"Error downloading step {step_hours}h: {e}")
                             # If we can't get a timestep, abort
                             return None
                     else:
@@ -449,7 +491,33 @@ def get_forecast_precipitation(forecast_time):
                         # Clean up partial file if it exists
                         if os.path.exists(grib_file):
                             os.remove(grib_file)
-
+                        # If we can't get a timestep, abort
+                        return None
+                except Exception as e:
+                    error_str = str(e)
+                    if attempt < max_retries - 1:
+                        # Check if it's a SlowDown error in the error string
+                        if "SlowDown" in error_str or "503" in error_str:
+                            # Exponential backoff with jitter
+                            retry_delay = base_retry_delay * (2**attempt)
+                            jitter = random.uniform(0, retry_delay * 0.3)
+                            total_delay = retry_delay + jitter
+                            logger.warning(
+                                f"SlowDown error on step {step_hours}h (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {total_delay:.1f}s..."
+                            )
+                            time.sleep(total_delay)
+                        else:
+                            logger.error(f"Error processing step {step_hours}h: {e}")
+                            # If we can't get a timestep, abort
+                            return None
+                    else:
+                        logger.error(
+                            f"Failed to download step {step_hours}h after {max_retries} attempts: {e}"
+                        )
+                        # Clean up partial file if it exists
+                        if os.path.exists(grib_file):
+                            os.remove(grib_file)
                         # If we can't get a timestep, abort
                         return None
 
