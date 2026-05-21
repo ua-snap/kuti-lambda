@@ -639,24 +639,14 @@ def lambda_handler(event, context):
 
     if historical_data is None:
         logger.error("No historical ECMWF data available, aborting processing.")
-        conn.close()
-        return {
-            "status": "error",
-            "message": "No historical ECMWF data available",
-            "timestamp": now.isoformat(),
-        }
+        raise RuntimeError("No historical ECMWF data available")
 
     logger.info("Retrieving ECMWF forecast data...")
     forecast_data = get_forecast_precipitation(forecast_time)
 
     if forecast_data is None:
         logger.error("No ECMWF forecast data available, aborting processing.")
-        conn.close()
-        return {
-            "status": "error",
-            "message": "No ECMWF forecast data available",
-            "timestamp": now.isoformat(),
-        }
+        raise RuntimeError("No ECMWF forecast data available")
 
     try:
         with conn.cursor() as cur:
@@ -670,12 +660,9 @@ def lambda_handler(event, context):
                     logger.error(
                         f"No Synoptic gauge data available for {place_name}, aborting processing."
                     )
-                    conn.close()
-                    return {
-                        "status": "error",
-                        "message": f"No Synoptic gauge data available for {place_name}",
-                        "timestamp": now.isoformat(),
-                    }
+                    raise RuntimeError(
+                        f"No Synoptic gauge data available for {place_name}"
+                    )
 
                 realtime_rainfall_mm = gauge_data["current_precip_mm"]
                 realtime_antecedent = gauge_data["antecedent_precip_mm"]
