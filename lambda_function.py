@@ -362,16 +362,30 @@ def get_historical_ecmwf_precipitation(forecast_time):
 
 def get_forecast_precipitation(forecast_time):
     """
-    Retrieve 84-hour ECMWF Open Data forecast precipitation for Craig and Kasaan.
+    Retrieve ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
     Data is available in 3 hour intervals starting at the 00 or 12 initialization of the model.
+
+    For a 3-day (72-hour) forecast:
+    - At 00z (midnight): downloads 3h to 72h (24 files)
+    - At 12z (noon): downloads 3h to 60h (20 files) - only needs 60h to cover remaining 3 days
+
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
 
     # Download from ECMWF's public S3 bucket instead of using rate-limited API
     try:
+        # Calculate how many forecast hours we need for a 3-day forecast
+        # At 00z: need 72 hours to cover 3 full days
+        # At 12z: need only 60 hours (12h remaining today + 48h for 2 more days)
+        if forecast_time.hour == 0:
+            max_forecast_hours = 72
+        else:  # 12z
+            max_forecast_hours = 60
+
         logger.info(
-            f"Downloading ECMWF forecast from S3 bucket for {forecast_time.strftime('%Y-%m-%d %HZ')}"
+            f"Downloading ECMWF forecast from S3 bucket for {forecast_time.strftime('%Y-%m-%d %HZ')} "
+            f"(up to {max_forecast_hours}h)"
         )
 
         # ECMWF S3 bucket structure: s3://ecmwf-forecasts/{date}/{time}z/ifs/0p25/oper/
@@ -388,10 +402,8 @@ def get_forecast_precipitation(forecast_time):
         # Required to subtract this value to get incremental precipitation.
         running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
 
-        # Download each timestep we need (3h, 6h, 9h, up to 84h)
-        # We need 84 hours to cover the full 72-hour forecast period with
-        # updates to the current forecast time every 3 hours.
-        for step_hours in range(3, 87, 3):
+        # Download each timestep we need (3h, 6h, 9h, up to max_forecast_hours)
+        for step_hours in range(3, max_forecast_hours + 3, 3):
             grib_file = f"/tmp/ecmwf_fc_{forecast_time.strftime('%Y%m%d%H')}_{step_hours}h.grib2"
             s3_key = f"{base_path}/{date_str}{forecast_time.hour:02d}0000-{step_hours}h-oper-fc.grib2"
 
