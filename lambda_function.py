@@ -628,16 +628,19 @@ def lambda_handler(event, context):
 
     now = datetime.now(alaska_tz)
 
-    expires_at = now + timedelta(hours=3)
-    expires_at_str = expires_at.isoformat()
-
     # Determine forecast initialization time (midnight or noon)
     if now.hour >= 12:
         forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
         max_forecast_hours = 60
+        # 12z data expires at 1 AM the next day (13 hours later)
+        expires_at = (now + timedelta(days=1)).replace(hour=1, minute=0, second=0, microsecond=0)
     else:
         forecast_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
         max_forecast_hours = 72
+        # 00z data expires at 1 PM same day (13 hours later)
+        expires_at = now.replace(hour=13, minute=0, second=0, microsecond=0)
+
+    expires_at_str = expires_at.isoformat()
 
     logger.info(
         f"Using forecast initialized at {forecast_time.strftime('%Y-%m-%d %HZ')}"
