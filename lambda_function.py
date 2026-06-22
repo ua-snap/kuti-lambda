@@ -360,7 +360,7 @@ def get_historical_ecmwf_precipitation(forecast_time):
         return None
 
 
-def get_forecast_precipitation(forecast_time):
+def get_forecast_precipitation(forecast_time, max_forecast_hours):
     """
     Retrieve ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
@@ -370,22 +370,17 @@ def get_forecast_precipitation(forecast_time):
     - At 00z (midnight): downloads 3h to 72h (24 files)
     - At 12z (noon): downloads 3h to 60h (20 files) - only needs 60h to cover remaining 3 days
 
+    Args:
+        forecast_time: Initialization time (00 or 12)
+        max_forecast_hours: Maximum forecast hours to download (72 at 00, 60 at 12)
+
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
 
     # Download from ECMWF's public S3 bucket instead of using rate-limited API
     try:
-        # Calculate how many forecast hours we need for a 3-day forecast
-        # At 00z: need 72 hours to cover 3 full days
-        # At 12z: need only 60 hours (12h remaining today + 48h for 2 more days)
-        if forecast_time.hour == 0:
-            max_forecast_hours = 72
-        else:  # 12z
-            max_forecast_hours = 60
-
         logger.info(
-            f"Downloading ECMWF forecast from S3 bucket for {forecast_time.strftime('%Y-%m-%d %HZ')} "
-            f"(up to {max_forecast_hours}h)"
+            f"Downloading ECMWF forecast from S3 bucket for {forecast_time.strftime('%Y-%m-%d %HZ')}"
         )
 
         # ECMWF S3 bucket structure: s3://ecmwf-forecasts/{date}/{time}z/ifs/0p25/oper/
@@ -402,7 +397,6 @@ def get_forecast_precipitation(forecast_time):
         # Required to subtract this value to get incremental precipitation.
         running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
 
-        # Download each timestep we need (3h, 6h, 9h, up to max_forecast_hours)
         for step_hours in range(3, max_forecast_hours + 3, 3):
             grib_file = f"/tmp/ecmwf_fc_{forecast_time.strftime('%Y%m%d%H')}_{step_hours}h.grib2"
             s3_key = f"{base_path}/{date_str}{forecast_time.hour:02d}0000-{step_hours}h-oper-fc.grib2"
@@ -640,8 +634,14 @@ def lambda_handler(event, context):
     # Determine forecast initialization time (midnight or noon)
     if now.hour >= 12:
         forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        max_forecast_hours = 60
     else:
         forecast_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        max_forecast_hours = 72
+
+    logger.info(
+        f"Using forecast initialized at {forecast_time.strftime('%Y-%m-%d %HZ')}"
+    )
 
     # Fetch historical ECMWF data for antecedent period from archived forecasts in S3
     logger.info(
@@ -654,7 +654,7 @@ def lambda_handler(event, context):
         raise RuntimeError("No historical ECMWF data available")
 
     logger.info("Retrieving ECMWF forecast data...")
-    forecast_data = get_forecast_precipitation(forecast_time)
+    forecast_data = get_forecast_precipitation(forecast_time, max_forecast_hours)
 
     if forecast_data is None:
         logger.error("No ECMWF forecast data available, aborting processing.")
