@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import random
 import cfgrib
 import xarray as xr
+import pandas as pd
 import pytz
 import pg8000
 import boto3
@@ -14,6 +15,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import requests
 import time
+from ecmwf.opendata import Client
 
 # Configure logging
 logger = logging.getLogger()
@@ -39,6 +41,11 @@ SYNOPTIC_API_TOKEN = os.environ.get("SYNOPTIC_API_TOKEN")
 # S3 configuration
 S3_BUCKET_NAME = "kuti-forecast-data"
 S3_CACHE_PREFIX = os.environ.get("S3_CACHE_PREFIX", "ecmwf-cache")
+
+# ECMWF data download strategy:
+# - Always tries ecmwf.opendata client first (downloads only 'tp' parameter, ~99% bandwidth reduction)
+# - Automatically falls back to direct S3 downloads if client fails
+# - Both historical and forecast data use this approach
 
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
@@ -167,7 +174,7 @@ def get_gauge_precipitation(place_name: str):
         return None
 
 
-def get_historical_ecmwf_precipitation(forecast_time):
+def get_historical_ecmwf_precipitation_with_s3(forecast_time):
     """
     Retrieve historical ECMWF forecast precipitation from public S3 bucket.
     Downloads archived forecast data to cover the time range [historical_start_time, forecast_time).
@@ -360,7 +367,149 @@ def get_historical_ecmwf_precipitation(forecast_time):
         return None
 
 
-def get_forecast_precipitation(forecast_time, max_forecast_hours):
+def get_historical_ecmwf_precipitation_with_client(forecast_time):
+    """
+    Retrieve historical ECMWF forecast precipitation using the ecmwf-opendata client.
+    Downloads archived forecast data to cover the time range [historical_start_time, forecast_time).
+    Filters to only 'tp' parameter for ~99% bandwidth reduction vs direct S3 downloads.
+    
+    Returns dict with Craig and Kasaan's data or None if unavailable.
+    """
+    historical_start_time = forecast_time - timedelta(hours=ANTECEDENT_PERIOD)
+
+    try:
+        logger.info(
+            f"Downloading historical ECMWF data: {historical_start_time.strftime('%Y-%m-%d %HZ')} to {forecast_time.strftime('%Y-%m-%d %HZ')}"
+        )
+
+        # We choose a historical initialization time earlier than the historical start time
+        # so that we have forecast data that cover that period.
+        init_time = historical_start_time.replace(minute=0, second=0, microsecond=0)
+        if init_time.hour == 12:
+            init_time = historical_start_time.replace(
+                hour=0
+            )  # Use midnight of same day
+        else:
+            # If historical_start_time is before noon, go back to previous day's noon forecast output
+            init_time = (historical_start_time - timedelta(days=1)).replace(hour=12)
+
+        logger.info(
+            f"Using forecast initialized at {init_time.strftime('%Y-%m-%d %HZ')} for historical data"
+        )
+
+        # Calculate which forecast steps we need
+        current_time = historical_start_time + timedelta(hours=3)
+        steps = []
+        while current_time <= forecast_time:
+            hours_from_init = int((current_time - init_time).total_seconds() / 3600)
+            steps.append(hours_from_init)
+            current_time += timedelta(hours=3)
+
+        logger.info(f"Requesting historical steps: {steps}")
+
+        # Initialize client
+        client = Client(source="aws", model="ifs", resol="0p25")
+        
+        date_str = init_time.strftime("%Y%m%d")
+        time_hour = init_time.hour
+        
+        # Download to temporary file
+        temp_file = f"/tmp/ecmwf_hist_{date_str}{time_hour:02d}.grib2"
+        
+        # Retrieve all historical timesteps in one batch
+        client.retrieve(
+            date=int(date_str),
+            time=time_hour,
+            stream="oper",
+            type="fc",
+            step=steps,
+            param=["tp"],  # Only total precipitation
+            target=temp_file,
+        )
+        
+        logger.info(f"Downloaded historical to {temp_file}, size: {os.path.getsize(temp_file) / 1024 / 1024:.2f} MB")
+        
+        # Parse the GRIB file
+        historical_data = {}
+        for place_name in LOCATIONS.keys():
+            historical_data[place_name] = []
+        
+        running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
+        
+        # Open all timesteps at once
+        ds = xr.open_dataset(
+            temp_file,
+            engine="cfgrib",
+            backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
+        )
+        
+        # Process each timestep
+        current_time = historical_start_time + timedelta(hours=3)
+        for step_hours in steps:
+            logger.info(f"Processing historical step {step_hours}h")
+            
+            # Select data for this specific step (convert hours to Timedelta)
+            step_data = ds.sel(step=pd.Timedelta(hours=step_hours))
+            
+            for place_name, location_info in LOCATIONS.items():
+                lat = location_info["lat"]
+                lon = location_info["lon"]
+                
+                # Pull the closest data location for this timestep
+                precip_values = step_data["tp"].sel(
+                    latitude=lat, longitude=lon, method="nearest"
+                )
+                
+                # Total precipitation is returned in meters
+                precip_m = float(precip_values.values)
+                
+                # Subtract running precipitation to get incremental precipitation
+                # Convert to millimeters divided by 3 hour period to get intensity mm/hr
+                precip_mm = ((precip_m - running_precip_m[place_name]) * 1000) / 3
+                
+                if precip_mm < 0:
+                    logger.warning(
+                        f"Negative historical precipitation detected for {place_name} at {current_time}: "
+                        f"precip_mm={precip_mm:.4f}, precip_m={precip_m:.6f}, running={running_precip_m[place_name]:.6f}. "
+                        f"Setting to 0.0"
+                    )
+                    precip_mm = 0.0
+                
+                # Set running total for next iteration
+                running_precip_m[place_name] = precip_m
+                
+                # Calculate timestamp in Alaska timezone
+                ts_alaska = current_time.astimezone(alaska_tz)
+                
+                historical_data[place_name].append(
+                    {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                )
+            
+            current_time += timedelta(hours=3)
+        
+        ds.close()
+        
+        # Clean up temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        
+        logger.info(f"Successfully retrieved {len(steps)} historical timesteps")
+        
+        if historical_data and any(historical_data.values()):
+            return historical_data
+        else:
+            logger.error("No historical data retrieved")
+            return None
+
+    except Exception as e:
+        logger.exception(f"Error retrieving historical ECMWF data with client: {e}")
+        # Clean up temp file on error
+        if 'temp_file' in locals() and os.path.exists(temp_file):
+            os.remove(temp_file)
+        return None
+
+
+def get_forecast_precipitation_with_s3(forecast_time, max_forecast_hours):
     """
     Retrieve ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
@@ -534,6 +683,132 @@ def get_forecast_precipitation(forecast_time, max_forecast_hours):
         return None
 
 
+def get_forecast_precipitation_with_client(forecast_time, max_forecast_hours):
+    """
+    TEST VERSION: Retrieve ECMWF forecast using the ecmwf-opendata Python client.
+    This approach filters to only 'tp' (total precipitation) parameter, reducing download
+    size by ~99% compared to downloading full GRIB2 files (20 MB vs 3.3 GB per run).
+    
+    Note: The ECMWF OpenData API doesn't support spatial subsetting, but parameter
+    filtering alone provides massive bandwidth savings.
+    
+    For a 3-day (72-hour) forecast:
+    - At 00z (midnight): downloads 3h to 72h (24 timesteps)
+    - At 12z (noon): downloads 3h to 60h (20 timesteps)
+    
+    Args:
+        forecast_time: Initialization time (00z or 12z)
+        max_forecast_hours: Maximum forecast hours to download (72 at 00z, 60 at 12z)
+    
+    Returns dict with Craig and Kasaan's data or None if unavailable.
+    """
+    try:
+        logger.info(
+            f"Downloading ECMWF forecast using ecmwf.opendata client for "
+            f"{forecast_time.strftime('%Y-%m-%d %HZ')}, fetching {max_forecast_hours} hours"
+        )
+        
+        # Initialize the ECMWF OpenData client with AWS source
+        client = Client(source="aws", model="ifs", resol="0p25")
+        
+        date_str = forecast_time.strftime("%Y%m%d")
+        time_hour = forecast_time.hour
+        
+        # Generate list of steps we need (3, 6, 9, ..., max_forecast_hours)
+        steps = list(range(3, max_forecast_hours + 3, 3))
+        
+        logger.info(f"Requesting {len(steps)} timesteps: {steps}")
+        
+        # Download to a temporary file
+        temp_file = f"/tmp/ecmwf_client_{date_str}{time_hour:02d}.grib2"
+        
+        # Retrieve all timesteps in one batch, filtering to only total precipitation
+        # Note: ECMWF OpenData API doesn't support spatial subsetting ('area' parameter)
+        # But filtering to just 'tp' reduces download from ~3.3 GB to ~20 MB (99.4% reduction)
+        client.retrieve(
+            date=int(date_str),
+            time=time_hour,
+            stream="oper",
+            type="fc",
+            step=steps,
+            param=["tp"],  # Only total precipitation
+            target=temp_file,
+        )
+        
+        logger.info(f"Downloaded to {temp_file}, size: {os.path.getsize(temp_file) / 1024 / 1024:.2f} MB")
+        
+        # Parse the GRIB file
+        forecast_data = {}
+        for place_name in LOCATIONS.keys():
+            forecast_data[place_name] = []
+        
+        running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
+        
+        # Open all timesteps at once
+        ds = xr.open_dataset(
+            temp_file,
+            engine="cfgrib",
+            backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
+        )
+        
+        # Process each timestep
+        for step_hours in steps:
+            logger.info(f"Processing step {step_hours}h")
+            
+            # Select data for this specific step (convert hours to Timedelta)
+            step_data = ds.sel(step=pd.Timedelta(hours=step_hours))
+            
+            for place_name, location_info in LOCATIONS.items():
+                lat = location_info["lat"]
+                lon = location_info["lon"]
+                
+                # Pull the closest data location for this timestep
+                precip_values = step_data["tp"].sel(
+                    latitude=lat, longitude=lon, method="nearest"
+                )
+                
+                ts = forecast_time + timedelta(hours=step_hours)
+                ts_alaska = ts.astimezone(alaska_tz)
+                
+                # Total precipitation is returned in meters
+                precip_m = float(precip_values.values)
+                
+                # Subtract running precipitation to get incremental precipitation
+                # Convert to millimeters divided by 3 hour period to get intensity mm/hr
+                precip_mm = ((precip_m - running_precip_m[place_name]) * 1000) / 3
+                
+                if precip_mm < 0:
+                    logger.warning(
+                        f"Negative forecast precipitation detected for {place_name} at step {step_hours}h: "
+                        f"precip_mm={precip_mm:.4f}, precip_m={precip_m:.6f}, running={running_precip_m[place_name]:.6f}. "
+                        f"Setting to 0.0"
+                    )
+                    precip_mm = 0.0
+                
+                # Set running total for next iteration
+                running_precip_m[place_name] = precip_m
+                
+                forecast_data[place_name].append(
+                    {"timestamp": ts_alaska.isoformat(), "precip_mm": precip_mm}
+                )
+        
+        ds.close()
+        
+        # Clean up temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        
+        logger.info(f"Successfully retrieved {len(steps)} timesteps")
+        return forecast_data
+        
+    except Exception as e:
+        logger.exception(f"Error downloading ECMWF forecast with client: {e}")
+        # Clean up temp file on error
+        if 'temp_file' in locals() and os.path.exists(temp_file):
+            os.remove(temp_file)
+        return None
+
+
 def calculate_forecast_blocks(forecast_data, historical_data):
     """
     Calculate intensity windows for the full 72-hour forecast period.
@@ -646,21 +921,33 @@ def lambda_handler(event, context):
         f"Using forecast initialized at {forecast_time.strftime('%Y-%m-%d %HZ')}"
     )
 
-    # Fetch historical ECMWF data for antecedent period from archived forecasts in S3
+    # Fetch historical ECMWF data for antecedent period
     logger.info(
-        f"Retrieving historical ECMWF data for {ANTECEDENT_PERIOD}-hour antecedent period from S3 archive..."
+        f"Retrieving historical ECMWF data using ecmwf.opendata client for {ANTECEDENT_PERIOD}-hour antecedent period..."
     )
-    historical_data = get_historical_ecmwf_precipitation(forecast_time)
+    historical_data = get_historical_ecmwf_precipitation_with_client(forecast_time)
+    
+    # Fallback to S3 if ECMWF client fails
+    if historical_data is None:
+        logger.warning("ECMWF client method failed for historical data, falling back to S3...")
+        historical_data = get_historical_ecmwf_precipitation_with_s3(forecast_time)
 
     if historical_data is None:
-        logger.error("No historical ECMWF data available, aborting processing.")
+        logger.error("No historical ECMWF data available (both client and S3 failed), aborting processing.")
         raise RuntimeError("No historical ECMWF data available")
 
-    logger.info("Retrieving ECMWF forecast data...")
-    forecast_data = get_forecast_precipitation(forecast_time, max_forecast_hours)
+    # Fetch forecast data
+    # Try client method first (99% bandwidth reduction), fall back to S3 if it fails
+    logger.info("Retrieving ECMWF forecast data using ecmwf.opendata client...")
+    forecast_data = get_forecast_precipitation_with_client(forecast_time, max_forecast_hours)
+    
+    # Fallback to S3 if ECMWF client fails
+    if forecast_data is None:
+        logger.warning("ECMWF client method failed for forecast data, falling back to S3...")
+        forecast_data = get_forecast_precipitation_with_s3(forecast_time, max_forecast_hours)
 
     if forecast_data is None:
-        logger.error("No ECMWF forecast data available, aborting processing.")
+        logger.error("No ECMWF forecast data available (both client and S3 failed), aborting processing.")
         raise RuntimeError("No ECMWF forecast data available")
 
     try:
