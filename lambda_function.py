@@ -52,6 +52,12 @@ ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 # Forecast covers through the end of this many Alaska calendar days, starting today
 FORECAST_DAYS = 3
 
+# Gauge data freshness limits. The latest observation must be no older than
+# GAUGE_MAX_AGE_MINUTES, and the antecedent timeseries must not have any gaps
+# (including at the start or end of the period) longer than GAUGE_MAX_GAP_MINUTES.
+GAUGE_MAX_AGE_MINUTES = int(os.environ.get("GAUGE_MAX_AGE_MINUTES", 120))
+GAUGE_MAX_GAP_MINUTES = int(os.environ.get("GAUGE_MAX_GAP_MINUTES", 120))
+
 # Location coordinates (lat, lon) for nearest grid cell lookup
 LOCATIONS = {
     "Craig": {
@@ -120,6 +126,9 @@ def get_gauge_precipitation(place_name: str):
             "token": SYNOPTIC_API_TOKEN,
             "stid": gauge_id,
             "vars": location_info["var"],
+            # Only return observations within the max age so an offline gauge
+            # doesn't return an old value as the latest observation
+            "within": str(GAUGE_MAX_AGE_MINUTES),
         }
 
         logger.info(f"Fetching current precipitation for {gauge_id}...")
@@ -128,10 +137,29 @@ def get_gauge_precipitation(place_name: str):
         latest_data = latest_response.json()
 
         # Extract current precipitation
-        current_precip = latest_data["STATION"][0]["OBSERVATIONS"][
+        latest_ob = latest_data["STATION"][0]["OBSERVATIONS"][
             f"{location_info['var']}_value_1"
-        ]["value"]
-        logger.info(f"Current precipitation for {gauge_id}: {current_precip} mm")
+        ]
+        current_precip = latest_ob["value"]
+        current_precip_time = datetime.fromisoformat(latest_ob["date_time"])
+        logger.info(
+            f"Current precipitation for {gauge_id}: {current_precip} mm at {current_precip_time.isoformat()}"
+        )
+
+        now_utc = datetime.now(pytz.utc)
+
+        # Double check the observation age in case the API ignores the "within" filter
+        current_precip_age = now_utc - current_precip_time
+        if current_precip_age > timedelta(minutes=GAUGE_MAX_AGE_MINUTES):
+            logger.error(
+                f"Latest observation for {gauge_id} is stale: {current_precip_time.isoformat()} "
+                f"is older than {GAUGE_MAX_AGE_MINUTES} minutes"
+            )
+            return None
+
+        if current_precip is None:
+            logger.error(f"Latest observation for {gauge_id} has no value")
+            return None
 
         antecedent_minutes = ANTECEDENT_PERIOD * 60
 
@@ -153,10 +181,36 @@ def get_gauge_precipitation(place_name: str):
         timeseries_response.raise_for_status()
         timeseries_data = timeseries_response.json()
 
+        timeseries_obs = timeseries_data["STATION"][0]["OBSERVATIONS"]
+
+        # Make sure the observations cover the full antecedent period without large
+        # gaps, otherwise the accumulated precipitation will be underestimated
+        ob_times = [datetime.fromisoformat(ts) for ts in timeseries_obs["date_time"]]
+        if not ob_times:
+            logger.error(f"No antecedent observations returned for {gauge_id}")
+            return None
+
+        period_start = now_utc - timedelta(hours=ANTECEDENT_PERIOD)
+        coverage_points = [period_start] + ob_times + [now_utc]
+        max_gap = max(
+            later - earlier
+            for earlier, later in zip(coverage_points, coverage_points[1:])
+        )
+        if max_gap > timedelta(minutes=GAUGE_MAX_GAP_MINUTES):
+            logger.error(
+                f"Antecedent observations for {gauge_id} have a gap of {max_gap} "
+                f"(max allowed {GAUGE_MAX_GAP_MINUTES} minutes) between "
+                f"{period_start.isoformat()} and {now_utc.isoformat()}"
+            )
+            return None
+
         # Extract ANTECEDENT_PERIOD hours of accumulated precipitation
-        antecedent_precip = timeseries_data["STATION"][0]["OBSERVATIONS"][
-            "precip_accumulated_set_1d"
-        ][-1]
+        antecedent_precip = timeseries_obs["precip_accumulated_set_1d"][-1]
+
+        if antecedent_precip is None:
+            logger.error(f"Accumulated antecedent precipitation for {gauge_id} has no value")
+            return None
+
         logger.info(
             f"{ANTECEDENT_PERIOD}-hour accumulated precipitation for {gauge_id}: {antecedent_precip} mm"
         )
