@@ -862,8 +862,8 @@ def calculate_forecast_blocks(forecast_data, historical_data):
     """
     Calculate intensity windows for the full 72-hour forecast period.
     For each 3 hour period, calculate:
-    - intensity_mm: rainfall in that discrete 3-hour period (single timestamp)
-    - antecedent_mm: sum of previous 3 hour periods within ANTECEDENT_PERIOD lookback
+    - intensity_mm: average rainfall rate (mm/hr) in that discrete 3-hour period (single timestamp)
+    - antecedent_mm: total rainfall (mm) in the previous 3 hour periods within ANTECEDENT_PERIOD lookback
 
     Historical data is prepended to forecast_data to provide
     complete antecedent coverage from the first forecast timestep.
@@ -901,11 +901,12 @@ def calculate_forecast_blocks(forecast_data, historical_data):
         # Intensity is ONLY the current 3-hour period
         intensity_mm = combined_data[i][1]
 
-        # Calculate antecedent: sum of previous timesteps within lookback window
+        # Calculate antecedent: total rainfall of previous timesteps within lookback window.
+        # Each timestep is a mm/hr rate over 3 hours, so multiply by 3 to get mm.
         # With historical data prepended, we now have full antecedent coverage
         lookback_start_index = i - timesteps_in_antecedent
         antecedent_mm = sum(
-            precip for dt, precip in combined_data[lookback_start_index:i]
+            precip * 3 for dt, precip in combined_data[lookback_start_index:i]
         )
 
         landslide_threshold_upper = landslide_threshold(antecedent_mm)
