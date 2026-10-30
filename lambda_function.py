@@ -49,6 +49,9 @@ S3_CACHE_PREFIX = os.environ.get("S3_CACHE_PREFIX", "ecmwf-cache")
 
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
+# Forecast covers through the end of this many Alaska calendar days, starting today
+FORECAST_DAYS = 3
+
 # Location coordinates (lat, lon) for nearest grid cell lookup
 LOCATIONS = {
     "Craig": {
@@ -513,15 +516,11 @@ def get_forecast_precipitation_with_s3(forecast_time, max_forecast_hours):
     """
     Retrieve ECMWF Open Data forecast precipitation for Craig and Kasaan.
     Downloads directly from ECMWF's public S3 bucket to avoid API rate limits.
-    Data is available in 3 hour intervals starting at the 00 or 12 initialization of the model.
-
-    For a 3-day (72-hour) forecast:
-    - At 00z (midnight): downloads 3h to 72h (24 files)
-    - At 12z (noon): downloads 3h to 60h (20 files) - only needs 60h to cover remaining 3 days
+    Data is available in 3 hour intervals starting at the 00z or 12z initialization of the model.
 
     Args:
-        forecast_time: Initialization time (00 or 12)
-        max_forecast_hours: Maximum forecast hours to download (72 at 00, 60 at 12)
+        forecast_time: UTC initialization time (00z or 12z)
+        max_forecast_hours: Maximum forecast hours from initialization to download
 
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
@@ -692,14 +691,10 @@ def get_forecast_precipitation_with_client(forecast_time, max_forecast_hours):
     Note: The ECMWF OpenData API doesn't support spatial subsetting, but parameter
     filtering alone provides massive bandwidth savings.
     
-    For a 3-day (72-hour) forecast:
-    - At 00z (midnight): downloads 3h to 72h (24 timesteps)
-    - At 12z (noon): downloads 3h to 60h (20 timesteps)
-    
     Args:
-        forecast_time: Initialization time (00z or 12z)
-        max_forecast_hours: Maximum forecast hours to download (72 at 00z, 60 at 12z)
-    
+        forecast_time: UTC initialization time (00z or 12z)
+        max_forecast_hours: Maximum forecast hours from initialization to download
+
     Returns dict with Craig and Kasaan's data or None if unavailable.
     """
     try:
@@ -903,19 +898,35 @@ def lambda_handler(event, context):
 
     now = datetime.now(alaska_tz)
 
-    # Determine forecast initialization time (midnight or noon)
+    # ECMWF initialization times are in UTC. Running at midnight Alaska time
+    # (08z/09z) uses the 00z run, and running at noon Alaska time (20z/21z)
+    # uses the 12z run.
+    now_utc = now.astimezone(pytz.utc)
+    if now_utc.hour >= 12:
+        forecast_time = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+    else:
+        forecast_time = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
     if now.hour >= 12:
-        forecast_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
-        max_forecast_hours = 60
-        # 12z data expires at 1 AM the next day (13 hours later)
+        # Noon run expires at 1 AM the next day (13 hours later)
         expires_at = (now + timedelta(days=1)).replace(hour=1, minute=0, second=0, microsecond=0)
     else:
-        forecast_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        max_forecast_hours = 72
-        # 00z data expires at 1 PM same day (13 hours later)
+        # Midnight run expires at 1 PM same day (13 hours later)
         expires_at = now.replace(hour=13, minute=0, second=0, microsecond=0)
 
     expires_at_str = expires_at.isoformat()
+
+    # Download enough forecast steps to reach the end of the last Alaska calendar day
+    # in the forecast, rounded up to the next 3 hour ECMWF timestep
+    forecast_end = alaska_tz.localize(
+        datetime.combine(now.date() + timedelta(days=FORECAST_DAYS), datetime.min.time())
+    )
+    hours_to_forecast_end = (forecast_end - forecast_time).total_seconds() / 3600
+    max_forecast_hours = math.ceil(hours_to_forecast_end / 3) * 3
+
+    logger.info(
+        f"Forecast window ends at {forecast_end.isoformat()}, downloading steps up to {max_forecast_hours}h"
+    )
 
     logger.info(
         f"Using forecast initialized at {forecast_time.strftime('%Y-%m-%d %HZ')}"
@@ -993,14 +1004,13 @@ def lambda_handler(event, context):
                     hours_since_init = (now - forecast_time).total_seconds() / 3600
                     current_forecast_hour = math.ceil(hours_since_init / 3) * 3
 
-                    # Filter to rolling 72-hour window starting from current time
+                    # Filter to blocks from the one containing the current time
+                    # through the end of the forecast window
                     rolling_72hr_blocks = [
                         block
                         for block in blocks_array
                         if block["forecast_hour"] >= current_forecast_hour
-                    ][
-                        :24
-                    ]  # 24 blocks = 72 hours
+                    ]
 
                     logger.info(
                         f"Rolling forecast window: {len(rolling_72hr_blocks)} windows from hour {current_forecast_hour}"
