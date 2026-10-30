@@ -273,10 +273,13 @@ def get_historical_ecmwf_precipitation_with_s3(forecast_time):
         # This is the precipitation accumulated up to the previous timestep
         running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
 
-        # Generate timesteps at 3 hour intervals, which matches the ECMWF output frequency
-        current_time = historical_start_time + timedelta(hours=3)
+        # Generate timesteps at 3 hour intervals, which matches the ECMWF output frequency.
+        # Precipitation is accumulated from init_time, so the step at historical_start_time
+        # is downloaded only to seed the running total and is not added to the output.
+        current_time = historical_start_time
         while current_time <= forecast_time:
             hours_from_init = int((current_time - init_time).total_seconds() / 3600)
+            is_seed_step = current_time == historical_start_time
 
             # Download this specific timestep
             grib_file = f"/tmp/ecmwf_hist_{init_time.strftime('%Y%m%d%H')}_{hours_from_init}h.grib2"
@@ -313,6 +316,10 @@ def get_historical_ecmwf_precipitation_with_s3(forecast_time):
 
                         # Total precipitation is returned in meters
                         precip_m = float(precip_values.values)
+
+                        if is_seed_step:
+                            running_precip_m[place_name] = precip_m
+                            continue
 
                         # Subtract running precipitation to get incremental precipitation.
                         # Convert to millimeters divided by 3 hour period to get intensity mm/hr
@@ -462,7 +469,11 @@ def get_historical_ecmwf_precipitation_with_client(forecast_time):
             steps.append(hours_from_init)
             current_time += timedelta(hours=3)
 
-        logger.info(f"Requesting historical steps: {steps}")
+        # Precipitation is accumulated from init_time, so the step at historical_start_time
+        # is also downloaded to seed the running total. It is not added to the output.
+        seed_step = int((historical_start_time - init_time).total_seconds() / 3600)
+
+        logger.info(f"Requesting historical steps: {[seed_step] + steps}")
 
         # Initialize client
         client = Client(source="aws", model="ifs", resol="0p25")
@@ -479,11 +490,11 @@ def get_historical_ecmwf_precipitation_with_client(forecast_time):
             time=time_hour,
             stream="oper",
             type="fc",
-            step=steps,
+            step=[seed_step] + steps,
             param=["tp"],  # Only total precipitation
             target=temp_file,
         )
-        
+
         logger.info(f"Downloaded historical to {temp_file}, size: {os.path.getsize(temp_file) / 1024 / 1024:.2f} MB")
         
         # Parse the GRIB file
@@ -491,15 +502,26 @@ def get_historical_ecmwf_precipitation_with_client(forecast_time):
         for place_name in LOCATIONS.keys():
             historical_data[place_name] = []
         
-        running_precip_m = {place_name: 0.0 for place_name in LOCATIONS.keys()}
-        
         # Open all timesteps at once
         ds = xr.open_dataset(
             temp_file,
             engine="cfgrib",
             backend_kwargs={"filter_by_keys": {"shortName": "tp"}},
         )
-        
+
+        # Seed the running total with the precipitation accumulated up to historical_start_time
+        seed_data = ds.sel(step=pd.Timedelta(hours=seed_step))
+        running_precip_m = {
+            place_name: float(
+                seed_data["tp"].sel(
+                    latitude=location_info["lat"],
+                    longitude=location_info["lon"],
+                    method="nearest",
+                ).values
+            )
+            for place_name, location_info in LOCATIONS.items()
+        }
+
         # Process each timestep
         current_time = historical_start_time + timedelta(hours=3)
         for step_hours in steps:
