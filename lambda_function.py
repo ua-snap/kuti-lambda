@@ -1043,109 +1043,117 @@ def lambda_handler(event, context):
         logger.error("No ECMWF forecast data available (both client and S3 failed), aborting processing.")
         raise RuntimeError("No ECMWF forecast data available")
 
-    # Connect only after the ECMWF data has been downloaded so the connection isn't
+    # Gather gauge data and calculate forecast blocks for every place before writing
+    # anything, so a failure for one place doesn't leave the other places inserted
+    rows = []
+    for place_name in places_to_run:
+        logger.info(f"Processing {place_name}...")
+
+        # Get real-time gauge precipitation data
+        gauge_data = get_gauge_precipitation(place_name)
+
+        if gauge_data is None:
+            logger.error(
+                f"No Synoptic gauge data available for {place_name}, aborting processing."
+            )
+            raise RuntimeError(
+                f"No Synoptic gauge data available for {place_name}"
+            )
+
+        realtime_rainfall_mm = gauge_data["current_precip_mm"]
+        realtime_antecedent = gauge_data["antecedent_precip_mm"]
+        gauge_id = LOCATIONS[place_name]["gauge_id"]
+        realtime_threshold_upper = landslide_threshold(realtime_antecedent)
+        realtime_risk_level = landslide_risk(
+            realtime_rainfall_mm, realtime_threshold_upper
+        )
+
+        # Calculate forecast blocks for this location
+        forecast_blocks = None
+
+        if place_name in forecast_data:
+            current_location_forecast = forecast_data[place_name]
+
+            # Get historical data for this location if available
+            current_location_historical = None
+            if historical_data and place_name in historical_data:
+                current_location_historical = historical_data[place_name]
+
+            blocks_array = calculate_forecast_blocks(
+                current_location_forecast, current_location_historical
+            )
+
+            # Calculate current forecast hour based on time since initialization
+            hours_since_init = (now - forecast_time).total_seconds() / 3600
+            current_forecast_hour = math.ceil(hours_since_init / 3) * 3
+
+            # Filter to blocks from the one containing the current time
+            # through the end of the forecast window
+            rolling_72hr_blocks = [
+                block
+                for block in blocks_array
+                if block["forecast_hour"] >= current_forecast_hour
+            ]
+
+            logger.info(
+                f"Rolling forecast window: {len(rolling_72hr_blocks)} windows from hour {current_forecast_hour}"
+            )
+            if rolling_72hr_blocks:
+                logger.info(
+                    f"First window: hour {rolling_72hr_blocks[0]['forecast_hour']} ending at {rolling_72hr_blocks[0]['timestamp']}"
+                )
+                logger.info(
+                    f"Last window: hour {rolling_72hr_blocks[-1]['forecast_hour']} ending at {rolling_72hr_blocks[-1]['timestamp']}"
+                )
+
+            # Convert to JSON string for PSQL JSONB column
+            forecast_blocks = json.dumps(rolling_72hr_blocks)
+        place_id = get_place_id(place_name)
+
+        rows.append(
+            (
+                now,
+                place_name,
+                place_id,
+                expires_at_str,
+                realtime_rainfall_mm,
+                realtime_threshold_upper,
+                realtime_risk_level,
+                gauge_id,
+                realtime_antecedent,
+                ANTECEDENT_PERIOD,
+                forecast_blocks,
+            )
+        )
+
+    sql = """
+    INSERT INTO landslide_risk (
+    ts, place_name, place_id, expires_at,
+    realtime_rainfall_mm, realtime_threshold_upper, realtime_risk_level,
+    gauge_id, realtime_antecedent_mm, antecedent_period,
+    forecast_blocks
+    ) VALUES (
+    %s, %s, %s, %s,
+    %s, %s, %s,
+    %s, %s, %s, %s
+    )
+    """
+
+    # Connect only after all data has been gathered so the connection isn't
     # left idle during downloads or left open if the downloads fail
     conn = pg8000.connect(
         host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
     )
-    conn.autocommit = True
 
     try:
+        # Insert all places in a single transaction so either every place is
+        # written or none are, which avoids duplicate rows when Lambda retries
         with conn.cursor() as cur:
-            for place_name in places_to_run:
-                logger.info(f"Processing {place_name}...")
+            for row in rows:
+                cur.execute(sql, row)
+        conn.commit()
 
-                # Get real-time gauge precipitation data
-                gauge_data = get_gauge_precipitation(place_name)
-
-                if gauge_data is None:
-                    logger.error(
-                        f"No Synoptic gauge data available for {place_name}, aborting processing."
-                    )
-                    raise RuntimeError(
-                        f"No Synoptic gauge data available for {place_name}"
-                    )
-
-                realtime_rainfall_mm = gauge_data["current_precip_mm"]
-                realtime_antecedent = gauge_data["antecedent_precip_mm"]
-                gauge_id = LOCATIONS[place_name]["gauge_id"]
-                realtime_threshold_upper = landslide_threshold(realtime_antecedent)
-                realtime_risk_level = landslide_risk(
-                    realtime_rainfall_mm, realtime_threshold_upper
-                )
-
-                # Calculate forecast blocks for this location
-                forecast_blocks = None
-
-                if place_name in forecast_data:
-                    current_location_forecast = forecast_data[place_name]
-
-                    # Get historical data for this location if available
-                    current_location_historical = None
-                    if historical_data and place_name in historical_data:
-                        current_location_historical = historical_data[place_name]
-
-                    blocks_array = calculate_forecast_blocks(
-                        current_location_forecast, current_location_historical
-                    )
-
-                    # Calculate current forecast hour based on time since initialization
-                    hours_since_init = (now - forecast_time).total_seconds() / 3600
-                    current_forecast_hour = math.ceil(hours_since_init / 3) * 3
-
-                    # Filter to blocks from the one containing the current time
-                    # through the end of the forecast window
-                    rolling_72hr_blocks = [
-                        block
-                        for block in blocks_array
-                        if block["forecast_hour"] >= current_forecast_hour
-                    ]
-
-                    logger.info(
-                        f"Rolling forecast window: {len(rolling_72hr_blocks)} windows from hour {current_forecast_hour}"
-                    )
-                    if rolling_72hr_blocks:
-                        logger.info(
-                            f"First window: hour {rolling_72hr_blocks[0]['forecast_hour']} ending at {rolling_72hr_blocks[0]['timestamp']}"
-                        )
-                        logger.info(
-                            f"Last window: hour {rolling_72hr_blocks[-1]['forecast_hour']} ending at {rolling_72hr_blocks[-1]['timestamp']}"
-                        )
-
-                    # Convert to JSON string for PSQL JSONB column
-                    forecast_blocks = json.dumps(rolling_72hr_blocks)
-                place_id = get_place_id(place_name)
-
-                sql = """
-                INSERT INTO landslide_risk (
-                ts, place_name, place_id, expires_at,
-                realtime_rainfall_mm, realtime_threshold_upper, realtime_risk_level,
-                gauge_id, realtime_antecedent_mm, antecedent_period,
-                forecast_blocks
-                ) VALUES (
-                %s, %s, %s, %s,
-                %s, %s, %s,
-                %s, %s, %s, %s
-                )
-                """
-                cur.execute(
-                    sql,
-                    (
-                        now,
-                        place_name,
-                        place_id,
-                        expires_at_str,
-                        realtime_rainfall_mm,
-                        realtime_threshold_upper,
-                        realtime_risk_level,
-                        gauge_id,
-                        realtime_antecedent,
-                        ANTECEDENT_PERIOD,
-                        forecast_blocks,
-                    ),
-                )
-
-                logger.info(f"Successfully processed {place_name}")
+        logger.info(f"Successfully inserted rows for {places_to_run}")
 
         return {
             "status": "ok",
@@ -1153,6 +1161,9 @@ def lambda_handler(event, context):
             "timestamp": now.isoformat(),
             "forecast_available": forecast_data is not None,
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
