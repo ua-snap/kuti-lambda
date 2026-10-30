@@ -891,6 +891,16 @@ def get_place_id(place_name: str) -> int:
 def lambda_handler(event, context):
     places_to_run = get_places_from_event(event)
 
+    # Fail before downloading anything so a misconfigured event doesn't report success
+    if not places_to_run:
+        logger.error(f"No places provided in event: {event}")
+        raise ValueError("No places provided in event")
+
+    unknown_places = [place for place in places_to_run if place not in LOCATIONS]
+    if unknown_places:
+        logger.error(f"Unknown places provided in event: {unknown_places}")
+        raise ValueError(f"Unknown places provided in event: {unknown_places}")
+
     conn = pg8000.connect(
         host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
     )
