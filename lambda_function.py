@@ -978,11 +978,6 @@ def lambda_handler(event, context):
         logger.error(f"Unknown places provided in event: {unknown_places}")
         raise ValueError(f"Unknown places provided in event: {unknown_places}")
 
-    conn = pg8000.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
-    )
-    conn.autocommit = True
-
     now = datetime.now(alaska_tz)
 
     # ECMWF initialization times are in UTC. Running at midnight Alaska time
@@ -1047,6 +1042,13 @@ def lambda_handler(event, context):
     if forecast_data is None:
         logger.error("No ECMWF forecast data available (both client and S3 failed), aborting processing.")
         raise RuntimeError("No ECMWF forecast data available")
+
+    # Connect only after the ECMWF data has been downloaded so the connection isn't
+    # left idle during downloads or left open if the downloads fail
+    conn = pg8000.connect(
+        host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME
+    )
+    conn.autocommit = True
 
     try:
         with conn.cursor() as cur:
