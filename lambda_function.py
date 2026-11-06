@@ -15,6 +15,9 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import requests
 import time
+import functools
+import multiurl
+import ecmwf.opendata.client as ecmwf_opendata_client
 from ecmwf.opendata import Client
 
 # Configure logging
@@ -44,8 +47,30 @@ S3_CACHE_PREFIX = os.environ.get("S3_CACHE_PREFIX", "ecmwf-cache")
 
 # ECMWF data download strategy:
 # - Always tries ecmwf.opendata client first (downloads only 'tp' parameter, ~99% bandwidth reduction)
+# - The client tries each mirror in ECMWF_CLIENT_SOURCES in order until one succeeds
 # - Automatically falls back to direct S3 downloads if client fails
 # - Both historical and forecast data use this approach
+ECMWF_CLIENT_SOURCES = [
+    source.strip()
+    for source in os.environ.get("ECMWF_CLIENT_SOURCES", "google,aws").split(",")
+    if source.strip()
+]
+
+# By default the ecmwf.opendata client retries busy (503) responses up to 500 times,
+# 120 seconds apart, which can run past the Lambda timeout. Retry only a few times with
+# a short backoff instead so a busy mirror fails quickly and the next mirror is tried.
+ECMWF_CLIENT_MAX_TRIES = int(os.environ.get("ECMWF_CLIENT_MAX_TRIES", 3))
+ECMWF_CLIENT_RETRY_AFTER = (5, 20, 2)  # seconds: wait 5, then double each retry up to 20
+ecmwf_opendata_client.robust = functools.partial(
+    multiurl.robust,
+    maximum_tries=ECMWF_CLIENT_MAX_TRIES,
+    retry_after=ECMWF_CLIENT_RETRY_AFTER,
+)
+ecmwf_opendata_client.download = functools.partial(
+    multiurl.download,
+    maximum_retries=ECMWF_CLIENT_MAX_TRIES,
+    retry_after=ECMWF_CLIENT_RETRY_AFTER,
+)
 
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
@@ -81,6 +106,25 @@ ecmwf_s3_client = boto3.client(
     "s3", region_name="eu-central-1", config=Config(signature_version=UNSIGNED)
 )
 ecmwf_bucket = "ecmwf-forecasts"
+
+
+def retrieve_with_ecmwf_client(target, **request):
+    """
+    Retrieve ECMWF Open Data with the ecmwf.opendata client, trying each mirror in
+    ECMWF_CLIENT_SOURCES in order. Raises the last error if every mirror fails.
+    """
+    last_error = None
+    for source in ECMWF_CLIENT_SOURCES:
+        try:
+            logger.info(f"Retrieving ECMWF data from {source} mirror")
+            client = Client(source=source, model="ifs", resol="0p25")
+            client.retrieve(target=target, **request)
+            return
+        except Exception as e:
+            logger.warning(f"ECMWF client failed using {source} mirror: {e}")
+            last_error = e
+
+    raise last_error
 
 
 def landslide_threshold(antecedent_mm: float) -> float:
@@ -475,9 +519,6 @@ def get_historical_ecmwf_precipitation_with_client(forecast_time):
 
         logger.info(f"Requesting historical steps: {[seed_step] + steps}")
 
-        # Initialize client
-        client = Client(source="aws", model="ifs", resol="0p25")
-        
         date_str = init_time.strftime("%Y%m%d")
         time_hour = init_time.hour
         
@@ -485,7 +526,7 @@ def get_historical_ecmwf_precipitation_with_client(forecast_time):
         temp_file = f"/tmp/ecmwf_hist_{date_str}{time_hour:02d}.grib2"
         
         # Retrieve all historical timesteps in one batch
-        client.retrieve(
+        retrieve_with_ecmwf_client(
             date=int(date_str),
             time=time_hour,
             stream="oper",
@@ -779,9 +820,6 @@ def get_forecast_precipitation_with_client(forecast_time, max_forecast_hours):
             f"{forecast_time.strftime('%Y-%m-%d %HZ')}, fetching {max_forecast_hours} hours"
         )
         
-        # Initialize the ECMWF OpenData client with AWS source
-        client = Client(source="aws", model="ifs", resol="0p25")
-        
         date_str = forecast_time.strftime("%Y%m%d")
         time_hour = forecast_time.hour
         
@@ -796,7 +834,7 @@ def get_forecast_precipitation_with_client(forecast_time, max_forecast_hours):
         # Retrieve all timesteps in one batch, filtering to only total precipitation
         # Note: ECMWF OpenData API doesn't support spatial subsetting ('area' parameter)
         # But filtering to just 'tp' reduces download from ~3.3 GB to ~20 MB (99.4% reduction)
-        client.retrieve(
+        retrieve_with_ecmwf_client(
             date=int(date_str),
             time=time_hour,
             stream="oper",
@@ -980,14 +1018,13 @@ def lambda_handler(event, context):
 
     now = datetime.now(alaska_tz)
 
-    # ECMWF initialization times are in UTC. Running at midnight Alaska time
-    # (08z/09z) uses the 00z run, and running at noon Alaska time (20z/21z)
-    # uses the 12z run.
-    now_utc = now.astimezone(pytz.utc)
-    if now_utc.hour >= 12:
-        forecast_time = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
-    else:
-        forecast_time = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    # ECMWF initialization times are in UTC. Before noon Alaska time, use the 00z run
+    # for the Alaska date, otherwise use the 12z run. The chosen run is always at least
+    # 8 hours old (published ~7.5 hours after initialization), so the code also works
+    # when run outside the scheduled midnight and noon times.
+    forecast_time = pytz.utc.localize(
+        datetime(now.year, now.month, now.day, 12 if now.hour >= 12 else 0)
+    )
 
     if now.hour >= 12:
         # Noon run expires at 1 AM the next day (13 hours later)
