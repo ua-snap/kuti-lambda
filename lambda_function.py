@@ -15,9 +15,6 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import requests
 import time
-import functools
-import multiurl
-import ecmwf.opendata.client as ecmwf_opendata_client
 from ecmwf.opendata import Client
 
 # Configure logging
@@ -61,16 +58,6 @@ ECMWF_CLIENT_SOURCES = [
 # a short backoff instead so a busy mirror fails quickly and the next mirror is tried.
 ECMWF_CLIENT_MAX_TRIES = int(os.environ.get("ECMWF_CLIENT_MAX_TRIES", 3))
 ECMWF_CLIENT_RETRY_AFTER = (5, 20, 2)  # seconds: wait 5, then double each retry up to 20
-ecmwf_opendata_client.robust = functools.partial(
-    multiurl.robust,
-    maximum_tries=ECMWF_CLIENT_MAX_TRIES,
-    retry_after=ECMWF_CLIENT_RETRY_AFTER,
-)
-ecmwf_opendata_client.download = functools.partial(
-    multiurl.download,
-    maximum_retries=ECMWF_CLIENT_MAX_TRIES,
-    retry_after=ECMWF_CLIENT_RETRY_AFTER,
-)
 
 ANTECEDENT_PERIOD = int(os.environ.get("ANTECEDENT_PERIOD", 24))  # hours
 
@@ -117,7 +104,16 @@ def retrieve_with_ecmwf_client(target, **request):
     for source in ECMWF_CLIENT_SOURCES:
         try:
             logger.info(f"Retrieving ECMWF data from {source} mirror")
-            client = Client(source=source, model="ifs", resol="0p25")
+            client = Client(
+                source=source,
+                model="ifs",
+                resol="0p25",
+                maximum_retries=ECMWF_CLIENT_MAX_TRIES,
+                retry_after=ECMWF_CLIENT_RETRY_AFTER,
+                # Ignore the server's Retry-After header, which could request a wait
+                # longer than the Lambda timeout
+                use_server_retry_after=False,
+            )
             client.retrieve(target=target, **request)
             return
         except Exception as e:
